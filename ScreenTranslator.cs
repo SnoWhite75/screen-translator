@@ -1231,7 +1231,9 @@ namespace ScreenTranslatorApp
             }
             int maxDim = 2000;
             try { maxDim = (int)WMO.OcrEngine.MaxImageDimension; } catch { }
-            float factor = Math.Min(2f, (float)maxDim / Math.Max(src.Width, src.Height));
+            int big = Math.Max(src.Width, src.Height);
+            // 작은 영역(자막 등)만 2배로 키워 읽고, 큰 화면은 원래 크기로 읽어요. Windows OCR 은 큰 글씨를 더 키우면 오히려 조각내요.
+            float factor = Math.Min(big >= 1000 ? 1f : 2f, (float)maxDim / big);
             Bitmap prep = src;
             bool own = false;
             if (Math.Abs(factor - 1f) > 0.01f)
@@ -1411,6 +1413,46 @@ namespace ScreenTranslatorApp
             return res;
         }
 
+        static bool IsWide(char c)
+        {
+            return c >= 0x3000;
+        }
+
+        // 꾸민 글꼴(글자 사이가 벌어진 메뉴 등)은 OCR 이 한 단어를 'コ' 'ンティ' 'ニュー' 처럼 조각내요.
+        // 같은 높이에서 바로 옆에 붙은 조각(4글자 이하)은 한 줄로 다시 이어요.
+        static List<LineInfo> JoinFragments(List<LineInfo> src)
+        {
+            List<LineInfo> l = new List<LineInfo>(src);
+            bool again = true;
+            while (again)
+            {
+                again = false;
+                for (int i = 0; i < l.Count && !again; i++)
+                {
+                    for (int j = 0; j < l.Count && !again; j++)
+                    {
+                        if (i == j) continue;
+                        LineInfo a = l[i], b = l[j];
+                        if (a.Text.Length > 4 && b.Text.Length > 4) continue;
+                        if (b.Rect.Left < a.Rect.Left) continue;
+                        float h = Math.Min(a.Rect.Height, b.Rect.Height);
+                        float overlap = Math.Min(a.Rect.Bottom, b.Rect.Bottom) - Math.Max(a.Rect.Top, b.Rect.Top);
+                        if (overlap < 0.6f * h) continue;
+                        float gap = b.Rect.Left - a.Rect.Right;
+                        if (gap < -0.3f * h || gap > 0.8f * Math.Max(a.Rect.Height, b.Rect.Height)) continue;
+                        bool wide = IsWide(a.Text[a.Text.Length - 1]) || IsWide(b.Text[0]);
+                        LineInfo m = new LineInfo();
+                        m.Text = a.Text + (wide ? "" : " ") + b.Text;
+                        m.Rect = RectangleF.Union(a.Rect, b.Rect);
+                        l[i] = m;
+                        l.RemoveAt(j);
+                        again = true;
+                    }
+                }
+            }
+            return l;
+        }
+
         const string OkPunct = " .,!?:;'\"()[]-–—…・ー、。「」『』！？：；（）〜~%/&+#*";
 
         // OCR 이 그림·로고·장식을 글자로 잘못 읽은 줄을 걸러요
@@ -1440,7 +1482,12 @@ namespace ScreenTranslatorApp
             List<LineInfo> lines = OcrService.Recognize(bmp, detect);
             if (OcrService.Error.Length > 0 && lines.Count == 0) { error = OcrService.Error; return new List<Item>(); }
             List<LineInfo> good = new List<LineInfo>();
-            foreach (LineInfo li in lines) if (!LooksLikeJunk(li.Text)) good.Add(li);
+            foreach (LineInfo li in JoinFragments(lines))
+            {
+                if (LooksLikeJunk(li.Text)) continue;
+                if (li.Rect.Height > 1.4f * li.Rect.Width) continue; // 세로로 긴 줄: 그림·장식을 잘못 읽은 경우가 대부분이고, 가로 번역문을 넣을 수도 없어요
+                good.Add(li);
+            }
             List<Para> paras = Merge(good);
             List<Para> todo = new List<Para>();
             foreach (Para p in paras) if (Translator.WorthTranslating(p.Text)) todo.Add(p);
@@ -2034,7 +2081,7 @@ namespace ScreenTranslatorApp
     // ------------------------------------------------------------------ app info / self update
     static class AppInfo
     {
-        public const int AppVersion = 9;
+        public const int AppVersion = 10;
 
         public static string DataDir()
         {
