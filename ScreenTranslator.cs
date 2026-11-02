@@ -572,7 +572,9 @@ namespace ScreenTranslatorApp
                 {
                     int t = line.IndexOf('\t');
                     if (t <= 0) continue;
-                    MemAdd(Unesc(line.Substring(0, t)), Unesc(line.Substring(t + 1)), false);
+                    string val = Unesc(line.Substring(t + 1));
+                    if (val.Length == 0) continue; // 예전 버전이 실패를 빈 번역으로 저장한 것 → 다시 번역
+                    MemAdd(Unesc(line.Substring(0, t)), val, false);
                 }
             }
             catch { }
@@ -592,7 +594,7 @@ namespace ScreenTranslatorApp
                     foreach (string k in memOrder)
                     {
                         string v;
-                        if (memory.TryGetValue(k, out v)) lines.Add(Esc(k) + "\t" + Esc(v));
+                        if (memory.TryGetValue(k, out v) && v.Length > 0) lines.Add(Esc(k) + "\t" + Esc(v));
                     }
                     memDirty = false;
                     lastSave = DateTime.UtcNow;
@@ -1702,10 +1704,12 @@ namespace ScreenTranslatorApp
             RectangleF all = new RectangleF(0, 0, ClientSize.Width, ClientSize.Height);
             using (StringFormat sf = new StringFormat(StringFormat.GenericTypographic))
             {
-                sf.FormatFlags |= StringFormatFlags.NoWrap;
+                // GenericTypographic 에 기본으로 들어 있는 LineLimit 은 "줄 높이보다 낮은 칸에는 글자를 아예 안 그림" 이라서
+                // 번역 박스만 칠해지고 글자가 사라졌어요. 플래그를 직접 지정하고, 칸이 아니라 좌표에 그려요.
+                sf.FormatFlags = StringFormatFlags.NoWrap | StringFormatFlags.NoClip;
                 sf.Trimming = StringTrimming.None;
                 sf.Alignment = StringAlignment.Near;
-                sf.LineAlignment = StringAlignment.Center;
+                sf.LineAlignment = StringAlignment.Near;
                 foreach (Item it in items)
                 {
                     if (it.Wrapped == null) continue;
@@ -1721,14 +1725,14 @@ namespace ScreenTranslatorApp
                     using (Font f = new Font("Malgun Gothic", it.FontSize, FontStyle.Regular, GraphicsUnit.Pixel))
                     using (SolidBrush fg = new SolidBrush(it.Fg))
                     {
+                        float lh = f.GetHeight(g); // 글꼴 한 줄 높이
                         GraphicsState gs = g.Save();
                         g.TranslateTransform(it.Rect.Left, it.Rect.Top);
                         g.ScaleTransform(sc, 1f);
-                        float lw = (it.Rect.Width + 2f) / sc;
                         for (int i = 0; i < it.Wrapped.Count; i++)
                         {
-                            RectangleF line = new RectangleF(0f, i * slot, lw, slot);
-                            g.DrawString(it.Wrapped[i], f, fg, line, sf);
+                            float y = i * slot + (slot - lh) / 2f; // 칸 가운데에 맞춰요
+                            g.DrawString(it.Wrapped[i], f, fg, new PointF(0f, y), sf);
                         }
                         g.Restore(gs);
                     }
@@ -1987,7 +1991,7 @@ namespace ScreenTranslatorApp
     // ------------------------------------------------------------------ app info / self update
     static class AppInfo
     {
-        public const int AppVersion = 7;
+        public const int AppVersion = 8;
 
         public static string DataDir()
         {
