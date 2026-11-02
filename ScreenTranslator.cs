@@ -636,6 +636,7 @@ namespace ScreenTranslatorApp
                 memOrder.Clear();
                 memDirty = false;
             }
+            lock (sessionPick) { sessionPick.Clear(); }
             SavedChars = 0;
             MemoryHits = 0;
             try { if (File.Exists(MemPath())) File.Delete(MemPath()); } catch { }
@@ -648,44 +649,99 @@ namespace ScreenTranslatorApp
         }
 
         // rxs/rys: 각 문장이 번역 영역 안에서 있던 위치(0~1). 확정 번역을 같은 자리에서 더 잘 찾는 데 써요.
-        public static bool RetranslateNext = false; // 다음 번역은 기억·캐시를 무시하고, 방금 쓴 엔진 말고 다른 엔진으로 해요
+        public static bool RetranslateNext = false; // 다음 번역은 기억·캐시를 건너뛰고, 방금 쓴 엔진 말고 다른 엔진으로 해요
         public static int LearnedHits = 0;
+        public static string[] LastOrigins = new string[0]; // 마지막 번역의 각 줄이 어디서 왔는지 (기억/메모리/엔진...)
+
+        static Dictionary<string, string> sessionPick = new Dictionary<string, string>();   // '다시 번역' 결과: 이번 실행 동안 유지
+        static Dictionary<string, List<string>> seen = new Dictionary<string, List<string>>(); // 원문별로 이미 보여준 번역
+
+        static string SessKey(string key) { return Squeeze(key) + "|" + DigitsOf(key); }
+
+        static void NoteSeen(string key, string ko)
+        {
+            if (string.IsNullOrEmpty(ko)) return;
+            string k = SessKey(key);
+            lock (seen)
+            {
+                if (seen.Count > 3000) seen.Clear();
+                List<string> l;
+                if (!seen.TryGetValue(k, out l)) { l = new List<string>(); seen[k] = l; }
+                string sq = Squeeze(ko);
+                foreach (string x in l) if (Squeeze(x) == sq) return;
+                l.Add(ko);
+                if (l.Count > 8) l.RemoveAt(0);
+            }
+        }
+
+        static bool WasSeen(string key, string ko)
+        {
+            string k = SessKey(key);
+            string sq = Squeeze(ko);
+            lock (seen)
+            {
+                List<string> l;
+                if (!seen.TryGetValue(k, out l)) return false;
+                foreach (string x in l) if (Squeeze(x) == sq) return true;
+            }
+            return false;
+        }
 
         static bool TokenOnly(string pt)
         {
             return Regex.IsMatch(pt, @"^[\W_]*(ZQ\d+Z[\W_]*)+$");
         }
 
+        // 번역 순서: (표시 안 함) → 기억한 번역 → 번역 메모리(번역 차단된 건 제외) → 번역 엔진.
+        // '다시 번역'이면 기억·메모리를 건너뛰고, 이미 보여준 번역과 다른 새 번역만 가져와요.
         public static string[] ToKorean(List<string> texts, float[] rxs, float[] rys)
+        {
+            string[] r = ToKoreanCore(texts, rxs, rys);
+            for (int i = 0; i < texts.Count; i++) if (r[i] != null) NoteSeen(Norm(texts[i]), r[i]);
+            return r;
+        }
+
+        static string[] ToKoreanCore(List<string> texts, float[] rxs, float[] rys)
         {
             bool redo = RetranslateNext;
             RetranslateNext = false;
-            string avoid = redo ? Engine : "";
+            string avoid = redo ? "|" + Engine + "|" : "";
             string[] result = new string[texts.Count];
+            string[] origin = new string[texts.Count];
+            LastOrigins = origin;
             Dictionary<string, List<int>> pending = new Dictionary<string, List<int>>();
             List<string> uniq = new List<string>();
             for (int i = 0; i < texts.Count; i++)
             {
                 string key = Norm(texts[i]);
                 string hit;
-                // 0순위: 사용자가 차단한 글자는 번역도 표시도 하지 않아요
-                if (Learned.IsBlocked(key, rxs != null ? rxs[i] : -1f, rys != null ? rys[i] : -1f)) { result[i] = null; continue; }
-                // 1순위: 사용자가 맞다고 확인한 번역 ('다시 번역'일 때는 건너뛰고, 기억된 그 문장은 지워요)
-                if (redo) Learned.RemoveSentence(key);
-                else if (Learned.LookupSentence(key, rxs != null ? rxs[i] : -1f, rys != null ? rys[i] : -1f, out hit))
+                float rx = rxs != null ? rxs[i] : -1f, ry = rys != null ? rys[i] : -1f;
+                // 표시 안 함: 사용자가 무시하라고 한 글자
+                if (Learned.IsBlocked(key, rx, ry)) { origin[i] = "표시안함"; continue; }
+                if (!redo)
                 {
-                    result[i] = hit;
-                    SavedChars += key.Length;
-                    MemoryHits++;
-                    LearnedHits++;
-                    continue;
-                }
-                if (!redo && MemLookup(key, out hit))
-                {
-                    result[i] = hit.Length == 0 ? null : hit;
-                    SavedChars += key.Length;
-                    MemoryHits++;
-                    continue;
+                    bool got;
+                    lock (sessionPick) { got = sessionPick.TryGetValue(SessKey(key), out hit); }
+                    if (got) { result[i] = hit; origin[i] = "다시번역"; continue; }
+                    // 1순위: 사용자가 맞다고 기억시킨 문장·단어
+                    if (Learned.LookupSentence(key, rx, ry, out hit))
+                    {
+                        result[i] = hit;
+                        origin[i] = "기억";
+                        SavedChars += key.Length;
+                        MemoryHits++;
+                        LearnedHits++;
+                        continue;
+                    }
+                    // 2순위: 번역 메모리 (사용자가 '번역 차단'한 번역은 가져오지 않아요)
+                    if (MemLookup(key, out hit) && (hit.Length == 0 || !Learned.IsBadTranslation(key, hit)))
+                    {
+                        result[i] = hit.Length == 0 ? null : hit;
+                        origin[i] = "메모리";
+                        SavedChars += key.Length;
+                        MemoryHits++;
+                        continue;
+                    }
                 }
                 List<int> l;
                 if (!pending.TryGetValue(key, out l)) { l = new List<int>(); pending[key] = l; uniq.Add(key); }
@@ -708,7 +764,7 @@ namespace ScreenTranslatorApp
                         chars += len;
                         pos++;
                     }
-                    // 확정 용어·문장은 자리표시자로 바꿔서 보내고, 번역문에서 확정 번역으로 되돌려요
+                    // 기억한 용어·문장은 자리표시자로 바꿔서 보내고, 번역문에서 기억한 번역으로 되돌려요 (조사도 맞춰요)
                     List<string> send = new List<string>();
                     List<int> sendIdx = new List<int>();
                     List<List<string>> kl = new List<List<string>>();
@@ -736,11 +792,13 @@ namespace ScreenTranslatorApp
                     for (int k = 0; k < part.Count; k++)
                     {
                         string o;
-                        if (direct[k] != null) o = direct[k];
+                        string org;
+                        if (direct[k] != null) { o = direct[k]; org = "기억(용어)"; }
                         else
                         {
                             if (outp[k] == null) continue; // 이 항목만 실패: 기억하지 않고 다음에 다시 시도해요
                             o = outp[k];
+                            org = kl[k].Count > 0 ? "엔진+용어" : "엔진";
                             if (kl[k].Count > 0)
                             {
                                 string restored;
@@ -753,12 +811,27 @@ namespace ScreenTranslatorApp
                                     string[] again = TranslateChunk(plain, avoid);
                                     if (again == null || again[0] == null) continue;
                                     o = again[0];
+                                    org = "엔진";
                                 }
                             }
+                            // '번역 차단'된 번역이거나, 다시 번역인데 이미 보여준 번역이면 다른 엔진으로 새로 받아요
+                            string tried = avoid;
+                            for (int tries = 0; tries < 3 && (Learned.IsBadTranslation(part[k], o) || (redo && WasSeen(part[k], o))); tries++)
+                            {
+                                tried += "|" + Engine + "|";
+                                List<string> plain2 = new List<string>();
+                                plain2.Add(part[k]);
+                                string[] again2 = TranslateChunk(plain2, tried);
+                                if (again2 == null || again2[0] == null) break;
+                                o = again2[0];
+                                org = "엔진";
+                            }
+                            if (Learned.IsBadTranslation(part[k], o)) continue; // 막힌 번역만 남으면 표시하지 않아요
                         }
                         if (string.Equals(o.Trim(), part[k].Trim(), StringComparison.OrdinalIgnoreCase)) o = "";
                         MemAdd(part[k], o, true);
-                        foreach (int idx in pending[part[k]]) result[idx] = o.Length == 0 ? null : o;
+                        if (redo && o.Length > 0) lock (sessionPick) { sessionPick[SessKey(part[k])] = o; org = "다시번역"; }
+                        foreach (int idx in pending[part[k]]) { result[idx] = o.Length == 0 ? null : o; origin[idx] = org; }
                     }
                 }
             }
@@ -781,18 +854,18 @@ namespace ScreenTranslatorApp
         {
             string[] r;
             List<string> errs = new List<string>();
-            if (DeepLKey.Length > 0 && avoid != "DeepL")
+            if (DeepLKey.Length > 0 && avoid.IndexOf("|DeepL|", StringComparison.Ordinal) < 0)
             {
                 r = ViaDeepL(part);
                 if (r != null) { Engine = "DeepL"; LastError = ""; return r; }
                 errs.Add("DeepL: " + lastDeepLError);
             }
-            r = avoid == "Microsoft" ? null : ViaMicrosoft(part);
+            r = avoid.IndexOf("|Microsoft|", StringComparison.Ordinal) >= 0 ? null : ViaMicrosoft(part);
             if (r != null) { Engine = "Microsoft"; LastError = ""; return r; }
             errs.Add("Microsoft: " + lastMsError);
 
             int gcd = (int)Math.Ceiling((googleBlockedUntil - DateTime.UtcNow).TotalSeconds);
-            if (avoid == "Google")
+            if (avoid.IndexOf("|Google|", StringComparison.Ordinal) >= 0)
             {
                 lastGoogleError = "건너뜀";
             }
@@ -807,7 +880,7 @@ namespace ScreenTranslatorApp
             }
             errs.Add("Google: " + lastGoogleError);
 
-            r = avoid == "Lingva" ? null : ViaLingva(part);
+            r = avoid.IndexOf("|Lingva|", StringComparison.Ordinal) >= 0 ? null : ViaLingva(part);
             if (r != null) { Engine = "Lingva"; LastError = ""; return r; }
             errs.Add("Lingva: " + lastLingvaError);
 
@@ -1111,7 +1184,8 @@ namespace ScreenTranslatorApp
     class LearnEntry
     {
         public bool Term;                 // false = 문장, true = 용어
-        public bool Block;                // true = 차단 (이 원문은 번역하지 않고 표시도 안 해요)
+        public bool Block;                // true = 표시 안 함 (이 원문은 번역하지 않고 표시도 안 해요)
+        public bool BadKo;                // true = 번역 차단 (이 원문에 대한 이 번역(Ko)은 가져오지 않아요)
         public string Src, Ko, Sq, Digits;
         public float RX = -1f, RY = -1f;  // 번역했던 영역 안에서의 위치 (0~1), 모르면 -1
     }
@@ -1155,6 +1229,7 @@ namespace ScreenTranslatorApp
                     if (f.Length < 3) continue;
                     LearnEntry e = f[0] == "B" ? Make(false, Translator.Unesc(f[1]), "x", -1f, -1f) : Make(f[0] == "T", Translator.Unesc(f[1]), Translator.Unesc(f[2]), -1f, -1f);
                     if (e != null && f[0] == "B") { e.Block = true; e.Ko = ""; }
+                    if (e != null && f[0] == "X") e.BadKo = true;
                     if (e == null) continue;
                     if (f.Length >= 5)
                     {
@@ -1165,7 +1240,7 @@ namespace ScreenTranslatorApp
                     l.Add(e);
                 }
                 lock (gate) { list = l; }
-                foreach (LearnEntry e in l) if (!e.Term && !e.Block) Translator.MemSet(e.Src, e.Ko);
+                foreach (LearnEntry e in l) if (!e.Term && !e.Block && !e.BadKo) Translator.MemSet(e.Src, e.Ko);
             }
             catch { }
         }
@@ -1178,7 +1253,7 @@ namespace ScreenTranslatorApp
                 lock (gate)
                 {
                     foreach (LearnEntry e in list)
-                        lines.Add((e.Block ? "B" : (e.Term ? "T" : "S")) + "\t" + Translator.Esc(e.Src) + "\t" + Translator.Esc(e.Ko) + "\t" +
+                        lines.Add((e.Block ? "B" : (e.BadKo ? "X" : (e.Term ? "T" : "S"))) + "\t" + Translator.Esc(e.Src) + "\t" + Translator.Esc(e.Ko) + "\t" +
                                   e.RX.ToString("0.###", CultureInfo.InvariantCulture) + "\t" + e.RY.ToString("0.###", CultureInfo.InvariantCulture));
                 }
                 string p = FilePath();
@@ -1204,7 +1279,7 @@ namespace ScreenTranslatorApp
         {
             lock (gate) { list = l; }
             Save();
-            foreach (LearnEntry e in l) if (!e.Term && !e.Block) Translator.MemSet(e.Src, e.Ko);
+            foreach (LearnEntry e in l) if (!e.Term && !e.Block && !e.BadKo) Translator.MemSet(e.Src, e.Ko);
         }
 
         // '다시 번역'을 눌렀을 때: 마음에 안 드는 기억된 문장을 지워요
@@ -1215,7 +1290,7 @@ namespace ScreenTranslatorApp
             lock (gate)
             {
                 for (int i = list.Count - 1; i >= 0; i--)
-                    if (!list[i].Term && !list[i].Block && list[i].Sq == sq && list[i].Digits == digits) { list.RemoveAt(i); any = true; }
+                    if (!list[i].Term && !list[i].Block && !list[i].BadKo && list[i].Sq == sq && list[i].Digits == digits) { list.RemoveAt(i); any = true; }
             }
             if (any) Save();
         }
@@ -1237,11 +1312,57 @@ namespace ScreenTranslatorApp
             lock (gate)
             {
                 for (int i = list.Count - 1; i >= 0; i--)
-                    if (!list[i].Term && list[i].Sq == e.Sq && list[i].Digits == e.Digits) list.RemoveAt(i);
+                    if (list[i].Block && list[i].Sq == e.Sq && list[i].Digits == e.Digits) list.RemoveAt(i);
                 list.Add(e);
                 while (list.Count > MaxEntries) list.RemoveAt(0);
             }
             Save();
+        }
+
+        public static LearnEntry NewBad(string src, string ko)
+        {
+            LearnEntry e = Make(false, src, ko, -1f, -1f);
+            if (e != null) e.BadKo = true;
+            return e;
+        }
+
+        // 이 원문에 대한 이 번역은 틀렸어요: 앞으로 메모리에서도 번역기에서도 이 번역은 쓰지 않아요 (원문은 계속 번역해요)
+        public static void AddBadTranslation(string src, string ko)
+        {
+            LearnEntry e = NewBad(src, ko);
+            if (e == null) return;
+            string ksq = Translator.Squeeze(e.Ko);
+            lock (gate)
+            {
+                for (int i = list.Count - 1; i >= 0; i--)
+                {
+                    LearnEntry o = list[i];
+                    if (o.Sq != e.Sq || o.Digits != e.Digits) continue;
+                    if (o.BadKo && Translator.Squeeze(o.Ko) == ksq) list.RemoveAt(i);
+                    else if (!o.Term && !o.Block && !o.BadKo && Translator.Squeeze(o.Ko) == ksq) list.RemoveAt(i); // 틀린 번역을 기억하고 있었다면 그 기억도 지워요
+                }
+                list.Add(e);
+                while (list.Count > MaxEntries) list.RemoveAt(0);
+            }
+            Save();
+        }
+
+        public static bool IsBadTranslation(string srcKey, string ko)
+        {
+            if (string.IsNullOrEmpty(ko)) return false;
+            string sq = Translator.Squeeze(srcKey), digits = Translator.DigitsOf(srcKey), ksq = Translator.Squeeze(ko);
+            lock (gate)
+            {
+                foreach (LearnEntry e in list)
+                {
+                    if (!e.BadKo || e.Digits != digits) continue;
+                    if (Translator.Squeeze(e.Ko) != ksq) continue;
+                    if (e.Sq == sq) return true;
+                    int maxD = sq.Length >= 10 ? sq.Length / 15 : 0;
+                    if (maxD > 0 && Translator.Lev(sq, e.Sq, maxD) <= maxD) return true;
+                }
+            }
+            return false;
         }
 
         public static bool IsBlocked(string key, float rx, float ry)
@@ -1276,8 +1397,14 @@ namespace ScreenTranslatorApp
             if (e == null) return;
             lock (gate)
             {
+                string ksq = Translator.Squeeze(e.Ko);
                 for (int i = list.Count - 1; i >= 0; i--)
-                    if (!list[i].Term && list[i].Sq == e.Sq && list[i].Digits == e.Digits) list.RemoveAt(i);
+                {
+                    LearnEntry o = list[i];
+                    if (o.Sq != e.Sq || o.Digits != e.Digits) continue;
+                    if (!o.Term && !o.Block && !o.BadKo) list.RemoveAt(i);                         // 같은 문장의 이전 기억은 덮어써요 ('표시 안 함'은 그대로 둬요 - 기억이 우선이에요)
+                    else if (o.BadKo && Translator.Squeeze(o.Ko) == ksq) list.RemoveAt(i);        // 다시 기억시킨 번역은 번역 차단에서 풀어요
+                }
                 list.Add(e);
                 while (list.Count > MaxEntries) list.RemoveAt(0);
             }
@@ -1298,7 +1425,7 @@ namespace ScreenTranslatorApp
             {
                 foreach (LearnEntry e in list)
                 {
-                    if (e.Block || e.Digits != digits) continue;
+                    if (e.Block || e.BadKo || e.Digits != digits) continue;
                     if (e.Sq == sq) { ko = e.Ko; return true; }
                     if (e.Term || sq.Length < 5) continue;
                     int maxD = sq.Length >= 10 ? sq.Length / 15 : 0;
@@ -1322,7 +1449,7 @@ namespace ScreenTranslatorApp
         {
             List<LearnEntry> terms = new List<LearnEntry>();
             // 용어뿐 아니라 기억한 문장도, 더 긴 문장 속에 그대로 들어 있으면 같이 써요 (실시간 번역에서 문단이 다르게 묶여도 적용되도록)
-            lock (gate) { foreach (LearnEntry e in list) if (!e.Block && (e.Term || e.Src.Length >= 8)) terms.Add(e); }
+            lock (gate) { foreach (LearnEntry e in list) if (!e.Block && !e.BadKo && (e.Term || e.Src.Length >= 8)) terms.Add(e); }
             if (terms.Count == 0) return text;
             terms.Sort(delegate (LearnEntry a, LearnEntry b) { return b.Src.Length.CompareTo(a.Src.Length); });
             string cur = text;
@@ -1349,16 +1476,61 @@ namespace ScreenTranslatorApp
             return cur;
         }
 
-        // 번역문 속 자리표시자를 확정 번역으로 되돌려요. 자리표시자가 사라졌거나 남았으면 false (원문을 통째로 다시 번역해야 해요)
+        // 마지막 글자의 받침: -1 알 수 없음, 0 없음, 1 있음, 2 ㄹ 받침
+        static int Batchim(string ko)
+        {
+            for (int i = ko.Length - 1; i >= 0; i--)
+            {
+                char c = ko[i];
+                if (c >= 0xAC00 && c <= 0xD7A3)
+                {
+                    int f = (c - 0xAC00) % 28;
+                    return f == 0 ? 0 : (f == 8 ? 2 : 1);
+                }
+                if (c >= '0' && c <= '9')
+                {
+                    int[] t = new int[] { 1, 2, 0, 1, 0, 0, 1, 2, 2, 0 }; // 영 일 이 삼 사 오 육 칠 팔 구
+                    return t[c - '0'];
+                }
+                if (char.IsWhiteSpace(c) || ")]}'\".,!?…~".IndexOf(c) >= 0) continue;
+                return -1;
+            }
+            return -1;
+        }
+
+        static string PickJosa(string j, int b)
+        {
+            if (b < 0) return j;
+            bool has = b >= 1;
+            switch (j)
+            {
+                case "은": case "는": return has ? "은" : "는";
+                case "이": case "가": return has ? "이" : "가";
+                case "을": case "를": return has ? "을" : "를";
+                case "와": case "과": return has ? "과" : "와";
+                case "으로": case "로": return b == 1 ? "으로" : "로";
+                case "이라": case "라": return has ? "이라" : "라";
+                case "이에요": case "예요": return has ? "이에요" : "예요";
+                case "이다": case "다": return has ? "이다" : "다";
+            }
+            return j;
+        }
+
+        // 번역문 속 자리표시자를 기억한 번역으로 되돌려요. 바로 뒤의 조사(은/는, 이/가, 을/를 ...)는 받침에 맞게 고쳐요.
+        // 자리표시자가 사라졌거나 남았으면 false (원문을 통째로 다시 번역해야 해요)
         public static bool Restore(string translated, List<string> kos, out string result)
         {
             result = translated;
             for (int i = 0; i < kos.Count; i++)
             {
                 string ko = kos[i];
-                Regex rx = new Regex("ZQ" + i + "Z", RegexOptions.IgnoreCase);
+                int b = Batchim(ko);
+                Regex rx = new Regex("ZQ" + i + "Z(?:(?<j>이에요|예요|으로|이라|이다|은|는|이|가|을|를|와|과|로|라|다)(?![가-힣]))?", RegexOptions.IgnoreCase);
                 if (!rx.IsMatch(result)) return false;
-                result = rx.Replace(result, delegate (Match m) { return ko; });
+                result = rx.Replace(result, delegate (Match m)
+                {
+                    return m.Groups["j"].Success ? ko + PickJosa(m.Groups["j"].Value, b) : ko;
+                });
             }
             if (Regex.IsMatch(result, @"ZQ\d+Z", RegexOptions.IgnoreCase)) return false;
             return true;
@@ -1534,14 +1706,17 @@ namespace ScreenTranslatorApp
             }
         }
 
-        // 지금 보이는 번역 중 잘못된 것을 골라 차단해요. 고른 것만 돌려줘요.
-        public static List<Item> PickBlock(List<Item> items)
+        // 지금 보이는 번역 중 잘못된 것을 골라요. '번역 차단'(이 번역만 막고 새로 번역) / '표시 안 함'(원문 자체를 무시)
+        public static void PickBlock(List<Item> items, out List<Item> badTr, out List<Item> hide)
         {
-            List<Item> picked = new List<Item>();
+            List<Item> bad = new List<Item>();
+            List<Item> hid = new List<Item>();
+            badTr = bad;
+            hide = hid;
             if (items == null || items.Count == 0)
             {
                 MessageBox.Show("차단할 번역이 아직 없어요. 먼저 번역을 한 번 해 주세요.", "잘못된 번역 차단");
-                return picked;
+                return;
             }
             List<Item> snap = new List<Item>(items);
             using (Form f = new Form())
@@ -1550,25 +1725,29 @@ namespace ScreenTranslatorApp
                 f.Font = new Font("Malgun Gothic", 9f);
                 f.StartPosition = FormStartPosition.CenterScreen;
                 f.TopMost = true;
-                f.ClientSize = new Size(780, 440);
-                f.MinimumSize = new Size(560, 300);
+                f.ClientSize = new Size(800, 460);
+                f.MinimumSize = new Size(600, 320);
                 Label info = new Label();
-                info.Text = "잘못 번역됐거나 번역할 필요 없는 줄(창 제목, 그림 속 글자 등)을 체크하세요.\n체크한 원문은 앞으로 번역하지도 표시하지도 않아요. 나중에 '기억 관리'에서 풀 수 있어요.";
-                info.SetBounds(12, 10, 756, 40);
+                info.Text = "번역 차단: 이 번역은 틀렸어요. 앞으로 이 번역은 쓰지 않고 바로 새로 번역해요.\n표시 안 함: 번역할 필요 없는 글자(창 제목, 그림 속 글자 등)예요. 앞으로 번역도 표시도 안 해요. ('기억 관리'에서 풀 수 있어요)";
+                info.SetBounds(12, 10, 776, 40);
                 info.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
                 f.Controls.Add(info);
                 DataGridView g = new DataGridView();
-                g.SetBounds(12, 56, 756, 320);
+                g.SetBounds(12, 56, 776, 340);
                 g.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
                 g.AllowUserToAddRows = false;
                 g.AllowUserToDeleteRows = false;
                 g.RowHeadersVisible = false;
                 g.BackgroundColor = SystemColors.Window;
                 g.AutoSizeRowsMode = DataGridViewAutoSizeRowsMode.AllCells;
-                DataGridViewCheckBoxColumn cOk = new DataGridViewCheckBoxColumn();
-                cOk.HeaderText = "차단";
-                cOk.Width = 46;
-                g.Columns.Add(cOk);
+                DataGridViewCheckBoxColumn cBad = new DataGridViewCheckBoxColumn();
+                cBad.HeaderText = "번역 차단";
+                cBad.Width = 70;
+                g.Columns.Add(cBad);
+                DataGridViewCheckBoxColumn cHide = new DataGridViewCheckBoxColumn();
+                cHide.HeaderText = "표시 안 함";
+                cHide.Width = 70;
+                g.Columns.Add(cHide);
                 DataGridViewTextBoxColumn cSrc = new DataGridViewTextBoxColumn();
                 cSrc.HeaderText = "원문";
                 cSrc.ReadOnly = true;
@@ -1583,13 +1762,13 @@ namespace ScreenTranslatorApp
                 g.Columns.Add(cKo);
                 foreach (Item it in snap)
                 {
-                    int ri = g.Rows.Add(false, it.Src, it.Text);
+                    int ri = g.Rows.Add(false, false, it.Src, it.Text);
                     g.Rows[ri].Tag = it;
                 }
                 f.Controls.Add(g);
                 Button go = new Button();
-                go.Text = "체크한 번역 차단";
-                go.SetBounds(12, 392, 190, 36);
+                go.Text = "적용";
+                go.SetBounds(12, 412, 190, 36);
                 go.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
                 go.Click += delegate
                 {
@@ -1597,21 +1776,22 @@ namespace ScreenTranslatorApp
                     foreach (DataGridViewRow r in g.Rows)
                     {
                         Item it = r.Tag as Item;
-                        if (it != null && Convert.ToBoolean(r.Cells[0].Value)) picked.Add(it);
+                        if (it == null) continue;
+                        if (Convert.ToBoolean(r.Cells[1].Value)) hid.Add(it);
+                        else if (Convert.ToBoolean(r.Cells[0].Value)) bad.Add(it);
                     }
                     f.Close();
                 };
                 f.Controls.Add(go);
                 Button close = new Button();
                 close.Text = "닫기";
-                close.SetBounds(682, 392, 86, 36);
+                close.SetBounds(702, 412, 86, 36);
                 close.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
                 close.DialogResult = DialogResult.Cancel;
                 f.Controls.Add(close);
                 f.CancelButton = close;
                 f.ShowDialog();
             }
-            return picked;
         }
 
         // 기억한 번역(문장·용어)을 보고 고치고 지우고 용어를 추가하는 창
@@ -1627,7 +1807,7 @@ namespace ScreenTranslatorApp
                 f.MinimumSize = new Size(560, 320);
 
                 Label info = new Label();
-                info.Text = "문장: 같은 문장이 나오면 이 번역을 그대로 써요.   용어: 문장 안에 이 단어가 있으면 항상 이 번역으로 바꿔서 번역해요.   차단: 이 원문은 번역하지도 표시하지도 않아요.\n" +
+                info.Text = "문장: 같은 문장이 나오면 이 번역을 그대로 써요.   용어: 문장 안에 이 단어가 있으면 항상 이 번역으로 바꿔서 번역해요.   표시 안 함: 이 원문은 번역도 표시도 안 해요.   번역 차단: 이 원문의 이 번역은 쓰지 않아요.\n" +
                             "맨 아래 빈 줄에 직접 용어를 추가할 수 있어요. 줄을 선택하고 Delete 키로 지워요. 마지막에 '저장'을 눌러야 반영돼요.";
                 info.SetBounds(12, 10, 756, 40);
                 info.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
@@ -1645,7 +1825,8 @@ namespace ScreenTranslatorApp
                 cKind.HeaderText = "종류";
                 cKind.Items.Add("문장");
                 cKind.Items.Add("용어");
-                cKind.Items.Add("차단");
+                cKind.Items.Add("표시 안 함");
+                cKind.Items.Add("번역 차단");
                 cKind.Width = 70;
                 g.Columns.Add(cKind);
                 DataGridViewTextBoxColumn cSrc = new DataGridViewTextBoxColumn();
@@ -1662,7 +1843,7 @@ namespace ScreenTranslatorApp
                 g.Columns.Add(cKo);
                 foreach (LearnEntry e in Learned.Snapshot())
                 {
-                    int ri = g.Rows.Add(e.Block ? "차단" : (e.Term ? "용어" : "문장"), e.Src, e.Ko);
+                    int ri = g.Rows.Add(e.Block ? "표시 안 함" : (e.BadKo ? "번역 차단" : (e.Term ? "용어" : "문장")), e.Src, e.Ko);
                     g.Rows[ri].Tag = e;
                 }
                 f.Controls.Add(g);
@@ -1690,7 +1871,7 @@ namespace ScreenTranslatorApp
                         string ko = r.Cells[2].Value == null ? "" : r.Cells[2].Value.ToString();
                         LearnEntry old = r.Tag as LearnEntry;
                         float rx = old != null ? old.RX : -1f, ry = old != null ? old.RY : -1f;
-                        LearnEntry e = kind == "차단" ? Learned.NewBlock(src, rx, ry) : Learned.NewEntry(kind == "용어", src, ko, rx, ry);
+                        LearnEntry e = (kind == "표시 안 함" || kind == "차단") ? Learned.NewBlock(src, rx, ry) : (kind == "번역 차단" ? Learned.NewBad(src, ko) : Learned.NewEntry(kind == "용어", src, ko, rx, ry));
                         if (e != null) l.Add(e);
                     }
                     Learned.ReplaceAll(l);
@@ -1748,6 +1929,7 @@ namespace ScreenTranslatorApp
         public RectangleF Rect;       // 원문이 있던 자리 (번역문은 이 안에만 그려요)
         public string Text;
         public string Src;            // 원문 (번역 기억에 쓰여요)
+        public string Origin;         // 이 번역이 어디서 왔는지 (기억/메모리/엔진...) - 디버그 표시용
         public float RX = -1f, RY = -1f; // 번역 영역 안에서의 위치 (0~1)
         public int Lines = 1;         // 원문 줄 수
         public float LineH;           // 원문 한 줄의 높이 (= 글자 크기에 가까워요)
@@ -2435,6 +2617,7 @@ namespace ScreenTranslatorApp
                 it.Rect = r;
                 it.Text = outText[i];
                 it.Src = todo[i].Text;
+                it.Origin = (Translator.LastOrigins != null && i < Translator.LastOrigins.Length) ? Translator.LastOrigins[i] : null;
                 it.RX = rxs[i];
                 it.RY = rys[i];
                 it.Lines = todo[i].Lines;
@@ -2462,7 +2645,8 @@ namespace ScreenTranslatorApp
                 f.AppendLine("--- 걸러낸 줄 ---");
                 f.Append(rejected.ToString());
                 f.AppendLine("--- 번역 (원문 => 결과) ---");
-                for (int k = 0; k < todo.Count; k++) f.AppendLine(todo[k].Text + "  =>  " + (outText[k] ?? "(없음)"));
+                for (int k = 0; k < todo.Count; k++)
+                    f.AppendLine("[" + (k < Translator.LastOrigins.Length ? (Translator.LastOrigins[k] ?? "실패") : "?") + "] " + todo[k].Text + "  =>  " + (outText[k] ?? "(없음)"));
                 f.AppendLine("--- OCR 원본 줄 [x,y 폭x높이] ---");
                 foreach (LineInfo r2 in lines)
                     f.AppendLine("[" + (int)r2.Rect.X + "," + (int)r2.Rect.Y + " " + (int)r2.Rect.Width + "x" + (int)r2.Rect.Height + "] " + r2.Text);
@@ -2819,6 +3003,19 @@ namespace ScreenTranslatorApp
                     if (Dbg.On)
                     {
                         using (Pen op = new Pen(Color.Orange, 2f)) g.DrawRectangle(op, it.Rect.X, it.Rect.Y, it.Rect.Width, it.Rect.Height);
+                        if (it.Origin != null)
+                        {
+                            // 이 번역이 어디서 왔는지 (기억=초록, 메모리=노랑, 엔진=흰색, 다시번역=하늘색)
+                            Color oc = it.Origin.StartsWith("기억") ? Color.LimeGreen : (it.Origin == "메모리" ? Color.Gold : (it.Origin == "다시번역" ? Color.Cyan : Color.White));
+                            using (Font of = new Font("Malgun Gothic", 10f, FontStyle.Bold, GraphicsUnit.Pixel))
+                            using (SolidBrush ob = new SolidBrush(oc))
+                            {
+                                SizeF om = g.MeasureString(it.Origin, of);
+                                float oy = Math.Max(0f, it.Rect.Top - om.Height);
+                                g.FillRectangle(Brushes.Black, it.Rect.Left, oy, om.Width, om.Height);
+                                g.DrawString(it.Origin, of, ob, it.Rect.Left, oy);
+                            }
+                        }
                     }
                 }
             }
@@ -3075,7 +3272,7 @@ namespace ScreenTranslatorApp
     // ------------------------------------------------------------------ app info / self update
     static class AppInfo
     {
-        public const int AppVersion = 17;
+        public const int AppVersion = 18;
 
         public static string DataDir()
         {
@@ -3985,20 +4182,27 @@ namespace ScreenTranslatorApp
 
         void BlockUi()
         {
-            List<Item> pick;
+            List<Item> bad, hide;
             reviewOpen = true;
-            try { pick = LearnUi.PickBlock(lastItems); }
+            try { LearnUi.PickBlock(lastItems, out bad, out hide); }
             finally { reviewOpen = false; }
-            if (pick == null || pick.Count == 0) return;
+            if (bad.Count == 0 && hide.Count == 0) return;
             List<Item> remain = new List<Item>(lastItems);
-            foreach (Item it in pick)
-            {
-                Learned.AddBlock(it.Src, it.RX, it.RY);
-                remain.Remove(it);
-            }
+            foreach (Item it in bad) { Learned.AddBadTranslation(it.Src, it.Text); remain.Remove(it); }
+            foreach (Item it in hide) { Learned.AddBlock(it.Src, it.RX, it.RY); remain.Remove(it); }
             lastItems = remain;
-            if (overlay != null) overlay.SetContent(remain, "");
-            panel.SetStatus(pick.Count + "개 번역을 차단했어요");
+            if (overlay != null) overlay.SetContent(remain, bad.Count > 0 ? "새로 번역 중..." : "");
+            panel.SetStatus((bad.Count > 0 ? bad.Count + "개 번역 차단 " : "") + (hide.Count > 0 ? hide.Count + "개 표시 안 함" : ""));
+            if (bad.Count > 0) RerunNow(); // 막은 번역 대신 새 번역을 바로 가져와요
+        }
+
+        void RerunNow()
+        {
+            if (overlay == null) return;
+            if (liveOn) { lastSig = null; return; }
+            watchTimer.Stop();
+            Bitmap bmp = CaptureClean(watchRect);
+            RunJob(bmp, true, ++jobId);
         }
 
         // 버튼을 누르는 순간 지금 보이는 번역을 전부 기억해요 (틀린 건 '기억 관리'나 '편집'에서 고치거나 지워요)
