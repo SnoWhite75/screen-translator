@@ -53,6 +53,7 @@ namespace ScreenTranslatorApp
         public int FailedVersion = 0;
         public string DeepLKey = "";
         public bool AutoClear = true;
+        public bool Debug = false;
 
         static string FilePath()
         {
@@ -82,6 +83,7 @@ namespace ScreenTranslatorApp
                             case "failedver": int.TryParse(v, out s.FailedVersion); break;
                             case "deeplkey": s.DeepLKey = v; break;
                             case "autoclear": s.AutoClear = v != "0"; break;
+                            case "debug": s.Debug = v == "1"; break;
                         }
                     }
                 }
@@ -104,6 +106,7 @@ namespace ScreenTranslatorApp
                 l.Add("failedver=" + FailedVersion);
                 l.Add("deeplkey=" + DeepLKey);
                 l.Add("autoclear=" + (AutoClear ? "1" : "0"));
+                l.Add("debug=" + (Debug ? "1" : "0"));
                 File.WriteAllLines(p, l.ToArray(), Encoding.UTF8);
             }
             catch { }
@@ -1011,6 +1014,32 @@ namespace ScreenTranslatorApp
     }
 
     // ------------------------------------------------------------------ OCR
+    static class Dbg
+    {
+        public static bool On;
+    }
+
+    class DbgBox
+    {
+        public RectangleF Rect;
+        public string Text, Why;
+        public int Kind; // 0 = OCR 원본 줄, 1 = 걸러낸 줄, 2 = 통과한 줄
+        public DbgBox(RectangleF r, string t, int kind, string why)
+        {
+            Rect = r;
+            Text = t;
+            Kind = kind;
+            Why = why;
+        }
+    }
+
+    class DebugInfo
+    {
+        public string Hud = "";   // 화면에 보여줄 요약
+        public string Full = "";  // debug_last.txt 에 저장할 전체 기록
+        public List<DbgBox> Boxes = new List<DbgBox>();
+    }
+
     class LineInfo
     {
         public string Text;
@@ -1130,6 +1159,7 @@ namespace ScreenTranslatorApp
         static Dictionary<string, WMO.OcrEngine> engines = new Dictionary<string, WMO.OcrEngine>();
         public static string BestLang = null;
         public static float BestFactor = 0f;
+        public static string LastInfo = "";
         public static string Error = "";
 
         public static List<string> Languages()
@@ -1290,9 +1320,10 @@ namespace ScreenTranslatorApp
             int n = nt * nf;
             List<LineInfo>[] results = new List<LineInfo>[n];
             string[] errs = new string[n];
+            long[] ms = new long[n];
             if (n == 1)
             {
-                RunTag(tryTags[0], raws[0], bws[0], bhs[0], factors[0], results, errs, 0);
+                RunTag(tryTags[0], raws[0], bws[0], bhs[0], factors[0], results, errs, ms, 0);
             }
             else
             {
@@ -1301,7 +1332,7 @@ namespace ScreenTranslatorApp
                 {
                     int idx = i;
                     int ti = i / nf, fi = i % nf;
-                    th[i] = new Thread(delegate () { RunTag(tryTags[ti], raws[fi], bws[fi], bhs[fi], factors[fi], results, errs, idx); });
+                    th[i] = new Thread(delegate () { RunTag(tryTags[ti], raws[fi], bws[fi], bhs[fi], factors[fi], results, errs, ms, idx); });
                     th[i].IsBackground = true;
                     th[i].Start();
                 }
@@ -1326,6 +1357,13 @@ namespace ScreenTranslatorApp
                 float fa = factors[i % nf], fb = factors[pick % nf];
                 if (fa < fb - 0.01f || (Math.Abs(fa - fb) < 0.01f && scores[i] > scores[pick])) pick = i;
             }
+            StringBuilder inf = new StringBuilder();
+            inf.AppendLine("OCR 설치 언어: " + string.Join(", ", langs.ToArray()));
+            for (int i = 0; i < n; i++)
+                inf.AppendLine("  " + tryTags[i / nf] + " @" + factors[i % nf].ToString("0.0") + "배: " +
+                               (results[i] == null ? "실패" : results[i].Count + "줄") + "  점수 " + scores[i] + "  " + ms[i] + "ms" +
+                               (errs[i] != null ? "  " + errs[i] : "") + (i == pick ? "  <== 선택" : ""));
+            LastInfo = inf.ToString();
             if (pick < 0) return new List<LineInfo>();
             BestLang = tryTags[pick / nf];
             BestFactor = factors[pick % nf];
@@ -1350,15 +1388,17 @@ namespace ScreenTranslatorApp
             return sc;
         }
 
-        static void RunTag(string tag, byte[] raw, int bw, int bh, float factor, List<LineInfo>[] results, string[] errs, int idx)
+        static void RunTag(string tag, byte[] raw, int bw, int bh, float factor, List<LineInfo>[] results, string[] errs, long[] ms, int idx)
         {
+            Stopwatch sw = Stopwatch.StartNew();
             try
             {
                 WMO.OcrEngine eng = Engine(tag);
-                if (eng == null) return;
+                if (eng == null) { errs[idx] = "엔진 생성 실패"; return; }
                 results[idx] = Run(raw, bw, bh, eng, factor);
             }
             catch (Exception ex) { errs[idx] = "OCR 오류: " + ex.Message; }
+            finally { ms[idx] = sw.ElapsedMilliseconds; }
         }
     }
 
@@ -1485,7 +1525,7 @@ namespace ScreenTranslatorApp
         const string OkPunct = " .,!?:;'\"()[]-–—…・ー、。「」『』！？：；（）〜~%/&+#*";
 
         // OCR 이 그림·로고·장식을 글자로 잘못 읽은 줄을 걸러요
-        static bool LooksLikeJunk(string t)
+        static string JunkReason(string t)
         {
             int letters = 0, weird = 0, hangul = 0, cjk = 0, jamo = 0;
             foreach (char c in t)
@@ -1497,24 +1537,69 @@ namespace ScreenTranslatorApp
                 else if (char.IsDigit(c)) { }
                 else if (OkPunct.IndexOf(c) < 0) weird++;
             }
-            if (letters == 0) return true;
-            if (jamo > 0) return true;                       // ㅏ ㅎ 같은 낱자모는 실제 화면 글자에서 거의 안 나와요
-            if (hangul > 0 && cjk > 0) return true;           // 한글과 가나·한자가 한 줄에 섞임 = 잘못 읽음
-            if (weird * 3 > t.Length) return true;            // 이상한 기호가 1/3 이상
-            if (cjk == 0 && letters <= 2 && t.Length <= 4) return true; // "4f", "l1" 같은 짧은 조각
-            return false;
+            if (letters == 0) return "글자 없음";
+            if (jamo > 0) return "낱자모";                       // ㅏ ㅎ 같은 낱자모는 실제 화면 글자에서 거의 안 나와요
+            if (hangul > 0 && cjk > 0) return "한글+일본어/한자 혼합";           // 한글과 가나·한자가 한 줄에 섞임 = 잘못 읽음
+            if (weird * 3 > t.Length) return "이상한 기호";            // 이상한 기호가 1/3 이상
+            if (cjk == 0 && letters <= 2 && t.Length <= 4) return "너무 짧음"; // "4f", "l1" 같은 짧은 조각
+            return null;
+        }
+
+        public static DebugInfo LastDebug;
+
+        static void SaveDebugFiles(Bitmap bmp, DebugInfo d)
+        {
+            try
+            {
+                string dir = AppInfo.DataDir();
+                File.WriteAllText(Path.Combine(dir, "debug_last.txt"), d.Full, new UTF8Encoding(true));
+                bmp.Save(Path.Combine(dir, "debug_last.png"), System.Drawing.Imaging.ImageFormat.Png);
+                string lg = Path.Combine(dir, "debug.log");
+                if (File.Exists(lg) && new FileInfo(lg).Length > 300000) File.Delete(lg);
+                File.AppendAllText(lg, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "\r\n" + d.Hud + "\r\n\r\n", Encoding.UTF8);
+            }
+            catch { }
         }
 
         public static List<Item> Process(Bitmap bmp, bool detect, out string error)
         {
             error = "";
+            LastDebug = null;
+            Stopwatch sw = Stopwatch.StartNew();
             List<LineInfo> lines = OcrService.Recognize(bmp, detect);
-            if (OcrService.Error.Length > 0 && lines.Count == 0) { error = OcrService.Error; return new List<Item>(); }
-            List<LineInfo> good = new List<LineInfo>();
-            foreach (LineInfo li in JoinFragments(lines))
+            long ocrMs = sw.ElapsedMilliseconds;
+            if (OcrService.Error.Length > 0 && lines.Count == 0)
             {
-                if (LooksLikeJunk(li.Text)) continue;
-                if (li.Rect.Height > 1.4f * li.Rect.Width) continue; // 세로로 긴 줄: 그림·장식을 잘못 읽은 경우가 대부분이고, 가로 번역문을 넣을 수도 없어요
+                error = OcrService.Error;
+                if (Dbg.On)
+                {
+                    DebugInfo d0 = new DebugInfo();
+                    d0.Hud = "v" + AppInfo.AppVersion + "  OCR 오류: " + error + "\n" + OcrService.LastInfo;
+                    d0.Full = d0.Hud;
+                    LastDebug = d0;
+                    SaveDebugFiles(bmp, d0);
+                }
+                return new List<Item>();
+            }
+            List<DbgBox> boxes = Dbg.On ? new List<DbgBox>() : null;
+            List<LineInfo> joined = JoinFragments(lines);
+            if (boxes != null)
+            {
+                foreach (LineInfo raw in lines) boxes.Add(new DbgBox(raw.Rect, raw.Text, 0, ""));
+            }
+            List<LineInfo> good = new List<LineInfo>();
+            StringBuilder rejected = new StringBuilder();
+            foreach (LineInfo li in joined)
+            {
+                string why = JunkReason(li.Text);
+                if (why == null && li.Rect.Height > 1.4f * li.Rect.Width) why = "세로로 긴 줄"; // 가로 번역문을 넣을 수 없고, 그림을 잘못 읽은 경우가 대부분이에요
+                if (why != null)
+                {
+                    if (boxes != null) boxes.Add(new DbgBox(li.Rect, li.Text, 1, why));
+                    rejected.AppendLine("[" + why + "] " + li.Text);
+                    continue;
+                }
+                if (boxes != null) boxes.Add(new DbgBox(li.Rect, li.Text, 2, ""));
                 good.Add(li);
             }
             List<Para> paras = Merge(good);
@@ -1523,7 +1608,10 @@ namespace ScreenTranslatorApp
 
             List<string> srcTexts = new List<string>();
             foreach (Para p in todo) srcTexts.Add(p.Text);
+            sw.Reset();
+            sw.Start();
             string[] outText = todo.Count > 0 ? Translator.ToKorean(srcTexts) : new string[0];
+            long trMs = sw.ElapsedMilliseconds;
             if (todo.Count > 0 && Translator.LastError.Length > 0) error = Translator.LastError;
 
             List<Item> items = new List<Item>();
@@ -1543,6 +1631,32 @@ namespace ScreenTranslatorApp
                 it.Bg = pix.Background(r);
                 it.Fg = pix.Foreground(r, it.Bg);
                 items.Add(it);
+            }
+
+            if (boxes != null)
+            {
+                DebugInfo d = new DebugInfo();
+                d.Boxes = boxes;
+                StringBuilder h = new StringBuilder();
+                h.AppendLine("v" + AppInfo.AppVersion + "  캡처 " + bmp.Width + "x" + bmp.Height + "  OCR " + ocrMs + "ms  번역 " + trMs + "ms  엔진 " +
+                             (Translator.Engine.Length > 0 ? Translator.Engine : "-") + "  메모리재사용 " + Translator.MemoryHits);
+                h.AppendLine("줄: OCR " + lines.Count + " > 이어붙임 " + joined.Count + " > 통과 " + good.Count + " > 문단 " + paras.Count +
+                             " > 번역대상 " + todo.Count + " > 표시 " + items.Count);
+                h.Append(OcrService.LastInfo);
+                if (error.Length > 0) h.AppendLine("오류: " + error);
+                d.Hud = h.ToString().TrimEnd();
+                StringBuilder f = new StringBuilder(d.Hud);
+                f.AppendLine();
+                f.AppendLine("--- 걸러낸 줄 ---");
+                f.Append(rejected.ToString());
+                f.AppendLine("--- 번역 (원문 => 결과) ---");
+                for (int k = 0; k < todo.Count; k++) f.AppendLine(todo[k].Text + "  =>  " + (outText[k] ?? "(없음)"));
+                f.AppendLine("--- OCR 원본 줄 [x,y 폭x높이] ---");
+                foreach (LineInfo r2 in lines)
+                    f.AppendLine("[" + (int)r2.Rect.X + "," + (int)r2.Rect.Y + " " + (int)r2.Rect.Width + "x" + (int)r2.Rect.Height + "] " + r2.Text);
+                d.Full = f.ToString();
+                LastDebug = d;
+                SaveDebugFiles(bmp, d);
             }
             return items;
         }
@@ -1641,6 +1755,7 @@ namespace ScreenTranslatorApp
     {
         List<Item> items = new List<Item>();
         string status = "";
+        DebugInfo dbg;
         static readonly Color KeyColor = Color.FromArgb(1, 2, 3);
 
         public OverlayForm(Rectangle bounds)
@@ -1677,6 +1792,12 @@ namespace ScreenTranslatorApp
         public void SetStatus(string st)
         {
             status = st;
+            Invalidate();
+        }
+
+        public void SetDebug(DebugInfo d)
+        {
+            dbg = d;
             Invalidate();
         }
 
@@ -1814,6 +1935,33 @@ namespace ScreenTranslatorApp
 
         protected override void OnPaintBackground(PaintEventArgs e) { }
 
+        // 디버그: OCR 이 읽은 줄 상자(회색=원본, 하늘색=통과, 빨강=걸러냄, 주황=최종 번역 칸)와 요약
+        void DrawDebug(Graphics g)
+        {
+            g.SmoothingMode = SmoothingMode.None;
+            using (Font df = new Font("Malgun Gothic", 11f, FontStyle.Regular, GraphicsUnit.Pixel))
+            {
+                foreach (DbgBox b in dbg.Boxes)
+                {
+                    Color col = b.Kind == 0 ? Color.FromArgb(170, 170, 170) : (b.Kind == 1 ? Color.Red : Color.Cyan);
+                    using (Pen p = new Pen(col, b.Kind == 1 ? 2f : 1f)) g.DrawRectangle(p, b.Rect.X, b.Rect.Y, b.Rect.Width, b.Rect.Height);
+                    if (b.Kind == 0) continue;
+                    string lab = b.Text.Length > 22 ? b.Text.Substring(0, 22) + "…" : b.Text;
+                    if (b.Why.Length > 0) lab += "  x " + b.Why;
+                    SizeF m = g.MeasureString(lab, df);
+                    float ty = b.Rect.Top - m.Height;
+                    if (ty < 0) ty = b.Rect.Bottom;
+                    using (SolidBrush bb = new SolidBrush(Color.FromArgb(210, 0, 0, 0))) g.FillRectangle(bb, b.Rect.Left, ty, m.Width, m.Height);
+                    using (SolidBrush tb = new SolidBrush(col)) g.DrawString(lab, df, tb, b.Rect.Left, ty);
+                }
+                SizeF hs = g.MeasureString(dbg.Hud, df);
+                float hy = ClientSize.Height - hs.Height - 8f;
+                if (hy < 30f) hy = 30f;
+                using (SolidBrush hb = new SolidBrush(Color.FromArgb(225, 0, 0, 0))) g.FillRectangle(hb, 4f, hy - 3f, hs.Width + 10f, hs.Height + 6f);
+                g.DrawString(dbg.Hud, df, Brushes.Yellow, 9f, hy);
+            }
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             Graphics g = e.Graphics;
@@ -1856,8 +2004,13 @@ namespace ScreenTranslatorApp
                         g.Restore(gs);
                     }
                     g.ResetClip();
+                    if (Dbg.On)
+                    {
+                        using (Pen op = new Pen(Color.Orange, 2f)) g.DrawRectangle(op, it.Rect.X, it.Rect.Y, it.Rect.Width, it.Rect.Height);
+                    }
                 }
             }
+            if (Dbg.On && dbg != null) DrawDebug(g);
             if (status.Length > 0)
             {
                 using (Font f = new Font("Malgun Gothic", 12f, FontStyle.Bold, GraphicsUnit.Pixel))
@@ -2110,7 +2263,7 @@ namespace ScreenTranslatorApp
     // ------------------------------------------------------------------ app info / self update
     static class AppInfo
     {
-        public const int AppVersion = 11;
+        public const int AppVersion = 12;
 
         public static string DataDir()
         {
@@ -2297,7 +2450,9 @@ namespace ScreenTranslatorApp
     // ------------------------------------------------------------------ main panel (버튼 UI)
     class MainPanel : Form
     {
-        public Action RegionClicked, LiveClicked, FullClicked, ClearClicked, SettingsClicked, LangClicked, HiddenToTray;
+        public Action RegionClicked, LiveClicked, FullClicked, ClearClicked, SettingsClicked, LangClicked, HiddenToTray, DebugFolderClicked;
+        public Action<bool> DebugToggled;
+        CheckBox ckDebug;
         Button bLive;
         Label lbStatus;
 
@@ -2317,7 +2472,7 @@ namespace ScreenTranslatorApp
             BackColor = Bg;
             ForeColor = Fg;
             Font = new Font("Malgun Gothic", 9.5f);
-            ClientSize = new Size(300, 392);
+            ClientSize = new Size(300, 428);
             Rectangle wa = Screen.PrimaryScreen.WorkingArea;
             Location = new Point(Math.Max(wa.Left, wa.Right - Width - 24), wa.Top + 80);
 
@@ -2355,11 +2510,19 @@ namespace ScreenTranslatorApp
             Controls.Add(lbStatus);
 
             Label hint = new Label();
-            hint.Text = "단축키  Ctrl+Alt+  T 영역 · L 실시간 · F 전체 · X 지우기";
+            hint.Text = "Ctrl+Alt+  T 영역 · L 실시간 · F 전체 · X 지움 · D 디버그";
             hint.Font = new Font("Malgun Gothic", 8f);
             hint.ForeColor = Dim;
-            hint.SetBounds(18, 372, 270, 16);
+            hint.SetBounds(18, 406, 270, 16);
             Controls.Add(hint);
+
+            ckDebug = new CheckBox();
+            ckDebug.Text = "디버그 모드";
+            ckDebug.ForeColor = Fg;
+            ckDebug.SetBounds(18, 372, 130, 24);
+            ckDebug.CheckedChanged += delegate { if (DebugToggled != null) DebugToggled(ckDebug.Checked); };
+            Controls.Add(ckDebug);
+            MakeButtonAt("디버그 폴더", 154, 372, 128, 26, BtnBg, 8.5f, delegate { if (DebugFolderClicked != null) DebugFolderClicked(); });
         }
 
         Button MakeButton(string text, int y, int h, Color bg, float size, Action click)
@@ -2396,6 +2559,11 @@ namespace ScreenTranslatorApp
         public void SetStatus(string s)
         {
             lbStatus.Text = s;
+        }
+
+        public void SetDebugChecked(bool on)
+        {
+            if (ckDebug.Checked != on) ckDebug.Checked = on;
         }
 
         protected override void OnHandleCreated(EventArgs e)
@@ -2629,6 +2797,7 @@ namespace ScreenTranslatorApp
             st = Settings.Load();
             Translator.DeepLKey = st.DeepLKey;
             Translator.LoadMemory();
+            Dbg.On = st.Debug;
             ShowInTaskbar = false;
             FormBorderStyle = FormBorderStyle.None;
             Opacity = 0;
@@ -2644,6 +2813,9 @@ namespace ScreenTranslatorApp
             panel.ClearClicked = delegate { Post(StopAll); };
             panel.SettingsClicked = delegate { Post(ShowSettings); };
             panel.LangClicked = delegate { Post(ShowLangInstaller); };
+            panel.SetDebugChecked(Dbg.On);
+            panel.DebugToggled = delegate (bool on) { Post(delegate { SetDebug(on); }); };
+            panel.DebugFolderClicked = delegate { try { Process.Start(AppInfo.DataDir()); } catch { } };
             panel.HiddenToTray = delegate
             {
                 if (hintShown) return;
@@ -2714,11 +2886,12 @@ namespace ScreenTranslatorApp
             Native.RegisterHotKey(Handle, 2, m, (uint)Keys.L);
             Native.RegisterHotKey(Handle, 3, m, (uint)Keys.F);
             Native.RegisterHotKey(Handle, 4, m, (uint)Keys.X);
+            Native.RegisterHotKey(Handle, 5, m, (uint)Keys.D);
         }
 
         protected override void OnHandleDestroyed(EventArgs e)
         {
-            for (int i = 1; i <= 4; i++) Native.UnregisterHotKey(Handle, i);
+            for (int i = 1; i <= 5; i++) Native.UnregisterHotKey(Handle, i);
             base.OnHandleDestroyed(e);
         }
 
@@ -2733,6 +2906,7 @@ namespace ScreenTranslatorApp
                     else if (id == 2) { if (liveOn) StopAll(); else StartRegion(true); }
                     else if (id == 3) StartFull();
                     else if (id == 4) StopAll();
+                    else if (id == 5) SetDebug(!Dbg.On);
                 });
                 return;
             }
@@ -2747,6 +2921,17 @@ namespace ScreenTranslatorApp
         void Notify(string title, string text)
         {
             try { notify.ShowBalloonTip(4000, title, text, ToolTipIcon.Info); } catch { }
+        }
+
+        void SetDebug(bool on)
+        {
+            Dbg.On = on;
+            st.Debug = on;
+            st.Save();
+            panel.SetDebugChecked(on);
+            if (!on && overlay != null) overlay.SetDebug(null);
+            lastSig = null; // 실시간 중이면 바로 다시 읽어서 디버그 정보를 채워요
+            panel.SetStatus(on ? "디버그 모드 켜짐: 다음 번역부터 OCR 상자와 진단이 보여요" : "디버그 모드 꺼짐");
         }
 
         void NotifyAct(string title, string text, Action act)
@@ -3048,7 +3233,8 @@ namespace ScreenTranslatorApp
             {
                 List<Item> items = new List<Item>();
                 string err = "";
-                try { items = Pipeline.Process(bmp, detect, out err); }
+                DebugInfo dbgInfo = null;
+                try { items = Pipeline.Process(bmp, detect, out err); dbgInfo = Pipeline.LastDebug; }
                 catch (Exception ex) { err = "오류: " + ex.Message; }
                 finally { bmp.Dispose(); }
                 Post(delegate
@@ -3067,6 +3253,7 @@ namespace ScreenTranslatorApp
                     if (err.Length > 0) status = err;
                     else if (items.Count == 0 && !liveOn) status = "번역할 외국어 텍스트를 찾지 못했어요";
                     overlay.SetContent(items, status);
+                    overlay.SetDebug(Dbg.On ? dbgInfo : null);
 
                     string ps;
                     if (err.Length > 0) ps = err;
@@ -3082,7 +3269,7 @@ namespace ScreenTranslatorApp
                         {
                             // 번역할 게 없으면 안내만 잠깐 보여주고 닫아요
                             System.Windows.Forms.Timer bye = new System.Windows.Forms.Timer();
-                            bye.Interval = err.Length > 0 ? 6000 : 2500;
+                            bye.Interval = Dbg.On ? 30000 : (err.Length > 0 ? 6000 : 2500);
                             bye.Tick += delegate { bye.Stop(); bye.Dispose(); if (id == jobId) CloseOverlay(); };
                             bye.Start();
                             // 글자를 못 읽었을 때: 다른 언어라면 OCR 언어팩이 없어서일 수 있어요 (5분에 한 번만 알려줘요)
