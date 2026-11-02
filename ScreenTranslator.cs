@@ -213,29 +213,35 @@ namespace ScreenTranslatorApp
     {
         public static Http Send(string url)
         {
-            return Request("GET", url, null, null, null);
+            return Request("GET", url, null, null, null, 15000);
+        }
+
+        public static Http Send(string url, int timeoutMs)
+        {
+            return Request("GET", url, null, null, null, timeoutMs);
         }
 
         public static Http Post(string url, string form, string authorization)
         {
-            return Request("POST", url, form, "application/x-www-form-urlencoded; charset=UTF-8", authorization);
+            return Request("POST", url, form, "application/x-www-form-urlencoded; charset=UTF-8", authorization, 15000);
         }
 
         public static Http PostJson(string url, string json, string authorization)
         {
-            return Request("POST", url, json, "application/json; charset=UTF-8", authorization);
+            return Request("POST", url, json, "application/json; charset=UTF-8", authorization, 15000);
         }
 
-        static Http Request(string method, string url, string body, string contentType, string authorization)
+        static Http Request(string method, string url, string body, string contentType, string authorization, int timeoutMs)
         {
             Http res = new Http();
             try
             {
                 HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
                 req.Method = method;
-                req.Timeout = 15000;
-                req.ReadWriteTimeout = 15000;
-                req.UserAgent = "Mozilla/5.0 ScreenTranslator/1.0";
+                req.Timeout = timeoutMs;
+                req.ReadWriteTimeout = timeoutMs;
+                req.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0";
+                req.ServicePoint.Expect100Continue = false;
                 if (authorization != null) req.Headers["Authorization"] = authorization;
                 if (body != null)
                 {
@@ -250,7 +256,7 @@ namespace ScreenTranslatorApp
             {
                 HttpWebResponse resp = ex.Response as HttpWebResponse;
                 if (resp != null) { using (resp) { Fill(res, resp); } }
-                else res.Error = ex.Message;
+                else res.Error = ex.Status + " - " + ex.Message;
             }
             catch (Exception ex)
             {
@@ -287,6 +293,10 @@ namespace ScreenTranslatorApp
         static DateTime msBlockedUntil = DateTime.MinValue;
         static string lastMsError = "";
 
+        // Lingva (Google 번역을 대신 요청해 주는 공개 서버, 무료)
+        static DateTime lingvaBlockedUntil = DateTime.MinValue;
+        static string lastLingvaError = "";
+
         // DeepL (선택, 무료 API 키)
         static string lastDeepLError = "";
 
@@ -320,7 +330,8 @@ namespace ScreenTranslatorApp
             if (DeepLKey.Length > 0) return 0;
             double g = (googleBlockedUntil - DateTime.UtcNow).TotalSeconds;
             double m = (msBlockedUntil - DateTime.UtcNow).TotalSeconds;
-            double s = Math.Min(g, m);
+            double lg = (lingvaBlockedUntil - DateTime.UtcNow).TotalSeconds;
+            double s = Math.Min(Math.Min(g, m), lg);
             return s > 0 ? (int)Math.Ceiling(s) : 0;
         }
 
@@ -328,6 +339,7 @@ namespace ScreenTranslatorApp
         {
             googleBlockedUntil = DateTime.MinValue;
             msBlockedUntil = DateTime.MinValue;
+            lingvaBlockedUntil = DateTime.MinValue;
             msToken = "";
             strikes = 0;
         }
@@ -429,7 +441,11 @@ namespace ScreenTranslatorApp
             }
             errs.Add("Google: " + lastGoogleError);
 
-            LastError = "번역 서버에 연결하지 못했어요 - " + string.Join(" / ", errs.ToArray());
+            r = ViaLingva(part);
+            if (r != null) { Engine = "Lingva"; LastError = ""; return r; }
+            errs.Add("Lingva: " + lastLingvaError);
+
+            LastError = "모든 번역 엔진이 실패했어요 - " + string.Join(" / ", errs.ToArray());
             Log(LastError);
             return null;
         }
@@ -469,7 +485,7 @@ namespace ScreenTranslatorApp
                 if (msToken.Length == 0 || DateTime.UtcNow >= msTokenExpires)
                 {
                     Http a = Fetcher.Send("https://edge.microsoft.com/translate/auth");
-                    if (a.Error != null) { err = "인증 서버에 연결하지 못했어요"; break; }
+                    if (a.Error != null) { err = "인증 서버 연결 실패 (" + a.Error + ")"; break; }
                     if (a.Status != 200 || a.Body.Trim().Length < 20) { err = "인증 실패 (HTTP " + a.Status + ")"; break; }
                     msToken = a.Body.Trim();
                     msTokenExpires = DateTime.UtcNow.AddMinutes(8);
@@ -482,9 +498,15 @@ namespace ScreenTranslatorApp
                 }
                 sb.Append(']');
                 Throttle(250);
-                Http r = Fetcher.PostJson("https://api-edge.cognitive.microsofttranslator.com/translate?to=ko&api-version=3.0&includeSentenceLength=true",
-                                          sb.ToString(), "Bearer " + msToken);
-                if (r.Error != null) { err = "번역 서버에 연결하지 못했어요"; break; }
+                Http r = null;
+                string[] msHosts = { "api-edge.cognitive.microsofttranslator.com", "api.cognitive.microsofttranslator.com" };
+                foreach (string mh in msHosts)
+                {
+                    r = Fetcher.PostJson("https://" + mh + "/translate?to=ko&api-version=3.0&includeSentenceLength=true",
+                                         sb.ToString(), "Bearer " + msToken);
+                    if (r.Error == null) break;
+                }
+                if (r.Error != null) { err = "번역 서버 연결 실패 (" + r.Error + ")"; break; }
                 if (r.Status == 401) { msToken = ""; err = "인증이 만료됐어요 (HTTP 401)"; continue; }
                 if (r.Status == 429)
                 {
@@ -593,6 +615,49 @@ namespace ScreenTranslatorApp
             return null;
         }
 
+        // ---------- Lingva (Google 프록시, 마지막 대체) ----------
+        static string[] ViaLingva(List<string> part)
+        {
+            if (DateTime.UtcNow < lingvaBlockedUntil)
+            {
+                lastLingvaError = "잠시 쉬는 중";
+                return null;
+            }
+            string joined = string.Join("\n", part.ToArray());
+            string enc = Uri.EscapeDataString(joined);
+            if (enc.Length > 1800) { lastLingvaError = "문장이 너무 길어요"; return null; }
+            string err = "알 수 없는 오류";
+            string[] hosts = { "https://lingva.ml", "https://lingva.lunar.icu" };
+            foreach (string h in hosts)
+            {
+                Throttle(300);
+                Http r = Fetcher.Send(h + "/api/v1/auto/ko/" + enc, 8000);
+                if (r.Error != null) { err = "연결 실패 (" + r.Error + ")"; continue; }
+                if (r.Status != 200) { err = "서버 오류 (HTTP " + r.Status + ")"; continue; }
+                try
+                {
+                    Dictionary<string, object> d = MiniJson.Parse(r.Body) as Dictionary<string, object>;
+                    string all = ((d["translation"] as string) ?? "").Replace("\r", "");
+                    if (part.Count == 1)
+                    {
+                        lastLingvaError = "";
+                        return new string[] { all.Replace("\n", " ").Trim() };
+                    }
+                    List<string> ls = new List<string>(all.Split('\n'));
+                    while (ls.Count > part.Count && ls[ls.Count - 1].Trim().Length == 0) ls.RemoveAt(ls.Count - 1);
+                    if (ls.Count != part.Count) { err = "번역 결과의 줄 수가 맞지 않아요"; continue; }
+                    for (int i = 0; i < ls.Count; i++) ls[i] = ls[i].Trim();
+                    lastLingvaError = "";
+                    return ls.ToArray();
+                }
+                catch { err = "응답을 해석하지 못했어요"; }
+            }
+            lingvaBlockedUntil = DateTime.UtcNow.AddSeconds(120);
+            lastLingvaError = err;
+            Log("Lingva: " + err);
+            return null;
+        }
+
         // ---------- DeepL (선택, 무료 API 키) ----------
         static string[] ViaDeepL(List<string> part)
         {
@@ -662,6 +727,11 @@ namespace ScreenTranslatorApp
                 r = ViaGoogle(sample);
                 if (r != null && r[0].Length > 0) { ok = true; sb.AppendLine("Google: 성공 → " + r[0]); }
                 else sb.AppendLine("Google: 실패 - " + lastGoogleError);
+
+                lingvaBlockedUntil = DateTime.MinValue;
+                r = ViaLingva(sample);
+                if (r != null && r[0].Length > 0) { ok = true; sb.AppendLine("Lingva: 성공 → " + r[0]); }
+                else sb.AppendLine("Lingva: 실패 - " + lastLingvaError);
 
                 sb.AppendLine();
                 sb.AppendLine(ok ? "하나라도 성공하면 번역은 동작해요. (자동으로 되는 엔진을 써요)" : "모든 엔진이 실패했어요. 인터넷 연결이나 방화벽을 확인해 주세요.");
@@ -1126,7 +1196,7 @@ namespace ScreenTranslatorApp
     // ------------------------------------------------------------------ app info / self update
     static class AppInfo
     {
-        public const int AppVersion = 3;
+        public const int AppVersion = 4;
 
         public static string DataDir()
         {
@@ -1481,7 +1551,7 @@ namespace ScreenTranslatorApp
             g2.SetBounds(14, 84, 432, 186);
             Controls.Add(g2);
             Label l2 = new Label();
-            l2.Text = "기본은 무료 번역(Microsoft → Google 순서로 자동 선택)이에요. 그래도 막히면 DeepL 무료 API 키를 넣어 주세요 (월 50만 자 무료, 키는 이 PC에만 저장). '번역 테스트'로 엔진별 상태를 볼 수 있어요.";
+            l2.Text = "기본은 무료 번역(Microsoft → Google → Lingva 순서로 자동 선택)이에요. 그래도 막히면 DeepL 무료 API 키를 넣어 주세요 (월 50만 자 무료, 키는 이 PC에만 저장). '번역 테스트'로 엔진별 상태를 볼 수 있어요.";
             l2.SetBounds(14, 22, 404, 52);
             g2.Controls.Add(l2);
             Label l2b = new Label();
@@ -2125,7 +2195,7 @@ namespace ScreenTranslatorApp
                 MessageBox.Show("이미 실행 중이에요.\n화면 오른쪽 아래 트레이(^) 아이콘을 눌러 보세요.", "화면 번역기");
                 return;
             }
-            try { ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; } catch { }
+            try { ServicePointManager.SecurityProtocol = (SecurityProtocolType)(3072 | 768 | 192); ServicePointManager.Expect100Continue = false; } catch { }
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new TrayForm());
