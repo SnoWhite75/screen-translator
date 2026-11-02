@@ -669,7 +669,8 @@ namespace ScreenTranslatorApp
                     if (outp == null) return result; // 실패: 지금까지 된 것만 돌려줘요 (이유는 LastError)
                     for (int k = 0; k < part.Count; k++)
                     {
-                        string o = outp[k] ?? "";
+                        if (outp[k] == null) continue; // 이 항목만 실패: 기억하지 않고 다음에 다시 시도해요
+                        string o = outp[k];
                         if (string.Equals(o.Trim(), part[k].Trim(), StringComparison.OrdinalIgnoreCase)) o = "";
                         MemAdd(part[k], o, true);
                         foreach (int idx in pending[part[k]]) result[idx] = o.Length == 0 ? null : o;
@@ -1021,6 +1022,7 @@ namespace ScreenTranslatorApp
         public float LineH;           // 원문 한 줄의 높이 (= 글자 크기에 가까워요)
         public Color Bg, Fg;
         public float FontSize;        // 배치 결과: 글자 크기
+        public float Scale = 1f;      // 배치 결과: 가로 압축 비율 (1 = 그대로)
         public List<string> Wrapped;  // 배치 결과: 줄바꿈된 문장들
     }
 
@@ -1172,18 +1174,12 @@ namespace ScreenTranslatorApp
             return op.GetResults();
         }
 
-        static List<LineInfo> Run(Bitmap bmp, WMO.OcrEngine eng, float factor)
+        static List<LineInfo> Run(byte[] raw, int bw, int bh, WMO.OcrEngine eng, float factor)
         {
             List<LineInfo> list = new List<LineInfo>();
             using (WSS.DataWriter dw = new WSS.DataWriter())
             {
                 // 비트맵 픽셀(BGRA)을 그대로 WinRT SoftwareBitmap 으로 넘겨요 (PNG 변환 없음)
-                System.Drawing.Imaging.BitmapData bd = bmp.LockBits(new Rectangle(0, 0, bmp.Width, bmp.Height),
-                    System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-                byte[] raw = new byte[bd.Stride * bd.Height];
-                int bw = bd.Width, bh = bd.Height;
-                try { Marshal.Copy(bd.Scan0, raw, 0, raw.Length); }
-                finally { bmp.UnlockBits(bd); }
                 dw.WriteBytes(raw);
                 WSS.IBuffer buf = dw.DetachBuffer();
                 using (WGI.SoftwareBitmap sb = WGI.SoftwareBitmap.CreateCopyFromBuffer(buf, WGI.BitmapPixelFormat.Bgra8, bw, bh))
@@ -1213,14 +1209,21 @@ namespace ScreenTranslatorApp
             return list;
         }
 
-        // detect: try every installed OCR language and keep the one that reads the most text
+        // 설치된 언어 목록을 다시 읽게 해요 (언어팩을 새로 설치한 뒤)
+        public static void ResetEngines()
+        {
+            lock (engines) { engines.Clear(); }
+            BestLang = null;
+        }
+
+        // detect: try every installed OCR language (in parallel) and keep the one that reads the most text
         public static List<LineInfo> Recognize(Bitmap src, bool detect)
         {
             Error = "";
             List<string> langs = Languages();
             if (langs.Count == 0)
             {
-                Error = "OCR 언어팩이 없어요. 설정 > 시간 및 언어 > 언어 및 지역에서 언어를 추가하세요";
+                Error = "OCR 언어팩이 없어요. 패널의 'OCR 언어 설치' 버튼으로 설치할 수 있어요";
                 return new List<LineInfo>();
             }
             int maxDim = 2000;
@@ -1240,23 +1243,51 @@ namespace ScreenTranslatorApp
             }
             try
             {
+                // 픽셀은 한 번만 읽어서 모든 언어가 같이 써요
+                byte[] raw;
+                int bw, bh;
+                System.Drawing.Imaging.BitmapData bd = prep.LockBits(new Rectangle(0, 0, prep.Width, prep.Height),
+                    System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                raw = new byte[bd.Stride * bd.Height];
+                bw = bd.Width;
+                bh = bd.Height;
+                try { Marshal.Copy(bd.Scan0, raw, 0, raw.Length); }
+                finally { prep.UnlockBits(bd); }
+
                 List<string> tryTags = new List<string>();
                 if (!detect && BestLang != null && langs.Contains(BestLang)) tryTags.Add(BestLang);
                 else { foreach (string t in langs) { if (tryTags.Count < 6) tryTags.Add(t); } }
 
+                int n = tryTags.Count;
+                List<LineInfo>[] results = new List<LineInfo>[n];
+                string[] errs = new string[n];
+                if (n == 1)
+                {
+                    RunTag(tryTags[0], raw, bw, bh, factor, results, errs, 0);
+                }
+                else
+                {
+                    Thread[] th = new Thread[n];
+                    for (int i = 0; i < n; i++)
+                    {
+                        int idx = i;
+                        th[i] = new Thread(delegate () { RunTag(tryTags[idx], raw, bw, bh, factor, results, errs, idx); });
+                        th[i].IsBackground = true;
+                        th[i].Start();
+                    }
+                    for (int i = 0; i < n; i++) th[i].Join();
+                }
+
                 List<LineInfo> best = new List<LineInfo>();
                 int bestScore = -1;
                 string bestTag = null;
-                foreach (string tag in tryTags)
+                for (int i = 0; i < n; i++)
                 {
-                    WMO.OcrEngine eng = Engine(tag);
-                    if (eng == null) continue;
-                    List<LineInfo> l;
-                    try { l = Run(prep, eng, factor); }
-                    catch (Exception ex) { Error = "OCR 오류: " + ex.Message; continue; }
+                    if (errs[i] != null) Error = errs[i];
+                    if (results[i] == null) continue;
                     int score = 0;
-                    foreach (LineInfo li in l) foreach (char c in li.Text) if (char.IsLetterOrDigit(c)) score++;
-                    if (score > bestScore) { bestScore = score; best = l; bestTag = tag; }
+                    foreach (LineInfo li in results[i]) foreach (char c in li.Text) if (char.IsLetterOrDigit(c)) score++;
+                    if (score > bestScore) { bestScore = score; best = results[i]; bestTag = tryTags[i]; }
                 }
                 if (bestTag != null && bestScore > 0) BestLang = bestTag;
                 return best;
@@ -1265,6 +1296,17 @@ namespace ScreenTranslatorApp
             {
                 if (own) prep.Dispose();
             }
+        }
+
+        static void RunTag(string tag, byte[] raw, int bw, int bh, float factor, List<LineInfo>[] results, string[] errs, int idx)
+        {
+            try
+            {
+                WMO.OcrEngine eng = Engine(tag);
+                if (eng == null) return;
+                results[idx] = Run(raw, bw, bh, eng, factor);
+            }
+            catch (Exception ex) { errs[idx] = "OCR 오류: " + ex.Message; }
         }
     }
 
@@ -1311,6 +1353,8 @@ namespace ScreenTranslatorApp
                     join = !EndsSentence(cur.Text) && !IsBullet(li.Text) &&
                            gap < 0.6 * h && gap > -0.5 * h &&
                            Math.Abs(li.Rect.Left - cur.Rect.Left) < 2.0 * h && ratio < 1.35;
+                    // 메뉴·버튼·목록처럼 짧은 줄은 이어진 문장이 아니에요 (앞줄이 충분히 길거나 다음 줄이 소문자로 시작할 때만 합쳐요)
+                    if (join && !(char.IsLower(li.Text[0]) || cur.LastW >= 12.0 * cur.LastH)) join = false;
                     // 앞줄이 다음 줄보다 훨씬 짧으면 제목·라벨이거나 문단의 끝이에요
                     if (join && cur.LastW < 0.6 * li.Rect.Width) join = false;
                     if (join && cur.Lines >= 2 && cur.LastW < 0.5 * cur.MaxW) join = false;
@@ -1491,12 +1535,13 @@ namespace ScreenTranslatorApp
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
         }
 
+        // 클릭 통과(TRANSPARENT)를 창 생성 때부터 넣어 둬요. 창이 다시 만들어져도 풀리지 않아요.
         protected override CreateParams CreateParams
         {
             get
             {
                 CreateParams cp = base.CreateParams;
-                cp.ExStyle |= Native.WS_EX_TOOLWINDOW | Native.WS_EX_NOACTIVATE;
+                cp.ExStyle |= Native.WS_EX_TOOLWINDOW | Native.WS_EX_NOACTIVATE | Native.WS_EX_TRANSPARENT | Native.WS_EX_LAYERED;
                 return cp;
             }
         }
@@ -1506,8 +1551,6 @@ namespace ScreenTranslatorApp
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
-            int ex = Native.GetWindowLong(Handle, Native.GWL_EXSTYLE);
-            Native.SetWindowLong(Handle, Native.GWL_EXSTYLE, ex | Native.WS_EX_TRANSPARENT | Native.WS_EX_LAYERED);
             try { ExcludedFromCapture = Native.SetWindowDisplayAffinity(Handle, Native.WDA_EXCLUDEFROMCAPTURE); }
             catch { ExcludedFromCapture = false; }
         }
@@ -1522,67 +1565,131 @@ namespace ScreenTranslatorApp
         {
             using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
             {
-                foreach (Item it in list) Layout(g, it);
+                foreach (Item it in list) FitItem(g, it);
             }
             items = list;
             status = st;
             Invalidate();
         }
 
-        // ---- 배치: 번역문이 원문 상자(가로·세로) 밖으로 절대 나가지 않게 글자 크기를 맞춰요 ----
-        static List<string> Wrap(string text, float limit, Func<string, float> w)
+        // ---- 배치: 번역문이 원문 상자(가로·세로) 밖으로 절대 나가지 않게 해요 ----
+        // 단어 폭은 100px 기준으로 한 번씩만 재고, 줄바꿈은 그 합으로 계산해요 (빠름).
+        static List<string> Wrap(string[] words, float[] ww, float sp, float limit, Func<string, float> w)
         {
             List<string> lines = new List<string>();
-            string[] words = text.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-            string cur = "";
-            foreach (string word0 in words)
+            StringBuilder cur = new StringBuilder();
+            float curW = 0f;
+            for (int i = 0; i < words.Length; i++)
             {
-                string word = word0;
-                string trial = cur.Length == 0 ? word : cur + " " + word;
-                if (w(trial) <= limit) { cur = trial; continue; }
-                if (cur.Length > 0) { lines.Add(cur); cur = ""; }
-                while (w(word) > limit && word.Length > 1)
+                float wd = ww[i];
+                if (cur.Length == 0)
                 {
-                    int n = word.Length;
-                    while (n > 1 && w(word.Substring(0, n)) > limit) n--;
-                    lines.Add(word.Substring(0, n));
-                    word = word.Substring(n);
+                    if (wd <= limit) { cur.Append(words[i]); curW = wd; continue; }
                 }
-                cur = word;
+                else if (curW + sp + wd <= limit)
+                {
+                    cur.Append(' ').Append(words[i]);
+                    curW += sp + wd;
+                    continue;
+                }
+                else
+                {
+                    lines.Add(cur.ToString());
+                    cur.Length = 0;
+                    curW = 0f;
+                    if (wd <= limit) { cur.Append(words[i]); curW = wd; continue; }
+                }
+                // 한 줄보다 긴 단어는 글자 단위로 쪼개요
+                string word = words[i];
+                int start = 0;
+                while (start < word.Length)
+                {
+                    int n = 1;
+                    while (start + n < word.Length && w(word.Substring(start, n + 1)) <= limit) n++;
+                    string piece = word.Substring(start, n);
+                    start += n;
+                    if (start < word.Length) lines.Add(piece);
+                    else { cur.Append(piece); curW = w(piece); }
+                }
             }
-            if (cur.Length > 0) lines.Add(cur);
+            if (cur.Length > 0) lines.Add(cur.ToString());
             if (lines.Count == 0) lines.Add("");
             return lines;
         }
 
-        static void Layout(Graphics g, Item it)
+        // 1) 글자를 가로로 최대 22%까지 눌러서 먼저 맞춰 보고  2) 그래도 안 되면 글자 크기를 줄여요.
+        static void FitItem(Graphics g, Item it)
         {
             RectangleF box = it.Rect;
             float s0 = Math.Max(8f, Math.Min(it.LineH * 1.05f, 72f)); // 원문 글자 크기보다 커지지 않아요
+            const float MinScale = 0.78f;
+            string[] words = it.Text.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            if (words.Length == 0)
+            {
+                it.Wrapped = new List<string>();
+                it.Wrapped.Add("");
+                it.FontSize = s0;
+                it.Scale = 1f;
+                return;
+            }
             using (Font refFont = new Font("Malgun Gothic", 100f, FontStyle.Regular, GraphicsUnit.Pixel))
             using (StringFormat sf = new StringFormat(StringFormat.GenericTypographic))
             {
                 sf.FormatFlags |= StringFormatFlags.MeasureTrailingSpaces;
-                Dictionary<string, float> widths = new Dictionary<string, float>();
-                // 글자 폭은 크기에 비례하므로 100px 기준으로 한 번만 재요
-                Func<string, float> w100 = delegate (string s)
+                Dictionary<string, float> cache = new Dictionary<string, float>();
+                Func<string, float> w = delegate (string s)
                 {
                     float v;
-                    if (widths.TryGetValue(s, out v)) return v;
+                    if (cache.TryGetValue(s, out v)) return v;
                     v = g.MeasureString(s, refFont, 1000000, sf).Width;
-                    widths[s] = v;
+                    cache[s] = v;
                     return v;
                 };
-                float size = s0;
-                List<string> lines;
-                while (true)
+                float[] ww = new float[words.Length];
+                for (int i = 0; i < words.Length; i++) ww[i] = w(words[i]);
+                float sp = Math.Max(1f, w("a a") - w("aa"));
+
+                Func<float, float, List<string>> wrapAt = delegate (float size, float c)
                 {
-                    lines = Wrap(it.Text, box.Width * 100f / size, w100);
-                    if (lines.Count * size * 1.1f <= box.Height + 0.5f || size <= 8f) break;
-                    size -= 0.5f;
+                    return Wrap(words, ww, sp, box.Width / c * 100f / size, w);
+                };
+                Func<float, float, bool> fits = delegate (float size, float c)
+                {
+                    return wrapAt(size, c).Count * size * 1.1f <= box.Height + 0.5f;
+                };
+
+                float fs;
+                if (fits(s0, MinScale)) fs = s0;
+                else if (!fits(8f, MinScale)) fs = 8f;
+                else
+                {
+                    float a = 8f, b = s0; // a: 들어감, b: 안 들어감
+                    while (b - a > 0.5f)
+                    {
+                        float m = (a + b) / 2f;
+                        if (fits(m, MinScale)) a = m; else b = m;
+                    }
+                    fs = a;
                 }
-                it.FontSize = size;
-                it.Wrapped = lines;
+
+                float sc = 1f;
+                if (!fits(fs, 1f))
+                {
+                    float c0 = MinScale, c1 = 1f; // c0: 들어감, c1: 안 들어감
+                    if (!fits(fs, c0)) sc = c0;
+                    else
+                    {
+                        while (c1 - c0 > 0.02f)
+                        {
+                            float m = (c0 + c1) / 2f;
+                            if (fits(fs, m)) c0 = m; else c1 = m;
+                        }
+                        sc = c0;
+                    }
+                }
+                it.FontSize = fs;
+                it.Scale = sc;
+                it.Wrapped = wrapAt(fs, sc);
             }
         }
 
@@ -1604,21 +1711,28 @@ namespace ScreenTranslatorApp
                 foreach (Item it in items)
                 {
                     if (it.Wrapped == null) continue;
-                    // 원문 글자가 삐져나오지 않도록 가장자리만 2px/1px 더 덮고, 그 밖으로는 나가지 않아요
-                    RectangleF cover = RectangleF.Inflate(it.Rect, 2f, 1f);
+                    // 원문 글자(내려쓴 획 포함)가 비치지 않도록 상하를 조금 더 덮되, 그 밖으로는 나가지 않아요
+                    float padY = Math.Max(1f, Math.Min(4f, it.LineH * 0.12f));
+                    RectangleF cover = RectangleF.Inflate(it.Rect, 2f, padY);
                     cover.Intersect(all);
                     if (cover.Width <= 0 || cover.Height <= 0) continue;
                     using (SolidBrush bg = new SolidBrush(it.Bg)) g.FillRectangle(bg, cover);
                     g.SetClip(cover);
                     float slot = it.Rect.Height / it.Wrapped.Count;
+                    float sc = it.Scale <= 0f ? 1f : it.Scale;
                     using (Font f = new Font("Malgun Gothic", it.FontSize, FontStyle.Regular, GraphicsUnit.Pixel))
                     using (SolidBrush fg = new SolidBrush(it.Fg))
                     {
+                        GraphicsState gs = g.Save();
+                        g.TranslateTransform(it.Rect.Left, it.Rect.Top);
+                        g.ScaleTransform(sc, 1f);
+                        float lw = (it.Rect.Width + 2f) / sc;
                         for (int i = 0; i < it.Wrapped.Count; i++)
                         {
-                            RectangleF line = new RectangleF(it.Rect.Left, it.Rect.Top + i * slot, it.Rect.Width + 2f, slot);
+                            RectangleF line = new RectangleF(0f, i * slot, lw, slot);
                             g.DrawString(it.Wrapped[i], f, fg, line, sf);
                         }
+                        g.Restore(gs);
                     }
                     g.ResetClip();
                 }
@@ -1636,10 +1750,246 @@ namespace ScreenTranslatorApp
         }
     }
 
+    // ------------------------------------------------------------------ OCR language packs
+    class LangPack
+    {
+        public string Cap, Name;
+        public string[] Keys;
+        public LangPack(string cap, string name, params string[] keys)
+        {
+            Cap = cap;
+            Name = name;
+            Keys = keys;
+        }
+    }
+
+    // 설치 안 된 OCR 언어팩을 사용자 승인 후에 설치해요 (Windows 기능 설치라 관리자 권한 확인 창이 떠요)
+    static class LangInstaller
+    {
+        static readonly LangPack[] Packs = new LangPack[]
+        {
+            new LangPack("en-US", "영어", "en"),
+            new LangPack("ja-JP", "일본어", "ja"),
+            new LangPack("zh-CN", "중국어 (간체)", "zh-hans", "zh-cn"),
+            new LangPack("zh-TW", "중국어 (번체)", "zh-hant", "zh-tw", "zh-hk"),
+            new LangPack("ko-KR", "한국어", "ko"),
+            new LangPack("ru-RU", "러시아어", "ru"),
+            new LangPack("de-DE", "독일어", "de"),
+            new LangPack("fr-FR", "프랑스어", "fr"),
+            new LangPack("es-ES", "스페인어", "es"),
+            new LangPack("it-IT", "이탈리아어", "it"),
+            new LangPack("pt-BR", "포르투갈어", "pt"),
+            new LangPack("nl-NL", "네덜란드어", "nl"),
+            new LangPack("pl-PL", "폴란드어", "pl"),
+            new LangPack("tr-TR", "터키어", "tr"),
+            new LangPack("uk-UA", "우크라이나어", "uk"),
+            new LangPack("ar-SA", "아랍어", "ar"),
+            new LangPack("th-TH", "태국어", "th"),
+            new LangPack("vi-VN", "베트남어", "vi")
+        };
+
+        static bool running;
+
+        static bool Match(string tag, string key)
+        {
+            string t = tag.ToLowerInvariant();
+            return t == key || t.StartsWith(key + "-", StringComparison.Ordinal);
+        }
+
+        static bool IsInstalled(LangPack p, List<string> have)
+        {
+            foreach (string h in have)
+                foreach (string k in p.Keys)
+                    if (Match(h, k)) return true;
+            return false;
+        }
+
+        static string BuildScript(List<LangPack> sel, string log)
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("$ErrorActionPreference='Continue';");
+            sb.Append("$log='" + log.Replace("'", "''") + "';$r=@();");
+            sb.Append("try{$all=Get-WindowsCapability -Online}catch{$all=@();$r+=('ERR '+$_.Exception.Message)};");
+            sb.Append("foreach($t in @(");
+            for (int i = 0; i < sel.Count; i++) sb.Append((i > 0 ? "," : "") + "'" + sel[i].Cap + "'");
+            sb.Append(")){");
+            sb.Append("try{$c=$all | Where-Object { $_.Name -like ('Language.OCR~~~'+$t+'*') } | Select-Object -First 1;");
+            sb.Append("if($c -eq $null){$r+=('NA '+$t)}");
+            sb.Append("elseif($c.State -eq 'Installed'){$r+=('OK '+$t)}");
+            sb.Append("else{Add-WindowsCapability -Online -Name $c.Name | Out-Null;$d=Get-WindowsCapability -Online -Name $c.Name;");
+            sb.Append("if($d.State -eq 'Installed'){$r+=('OK '+$t)}else{$r+=('FAIL '+$t)}}");
+            sb.Append("}catch{$r+=('ERR '+$t+' '+$_.Exception.Message)}};");
+            sb.Append("$r | Out-File -Encoding utf8 $log");
+            return sb.ToString();
+        }
+
+        static string NameOf(string cap)
+        {
+            foreach (LangPack p in Packs) if (p.Cap == cap) return p.Name;
+            return cap;
+        }
+
+        static string Summarize(string result, out bool anyOk)
+        {
+            anyOk = false;
+            if (result == null || result.Trim().Length == 0)
+                return "설치 결과를 확인하지 못했어요.\n관리자 권한 확인 창에서 '아니요'를 눌렀거나, Windows 가 설치를 끝내지 못했을 수 있어요.";
+            StringBuilder sb = new StringBuilder();
+            foreach (string raw in result.Split('\n'))
+            {
+                string line = raw.Trim().TrimStart('﻿');
+                if (line.Length == 0) continue;
+                int sp = line.IndexOf(' ');
+                string kind = sp > 0 ? line.Substring(0, sp) : line;
+                string rest = sp > 0 ? line.Substring(sp + 1).Trim() : "";
+                if (kind == "OK") { anyOk = true; sb.AppendLine("✔ " + NameOf(rest) + " - 설치됨"); }
+                else if (kind == "NA") sb.AppendLine("✖ " + NameOf(rest) + " - 이 Windows 에서는 제공되지 않아요");
+                else if (kind == "FAIL") sb.AppendLine("✖ " + NameOf(rest) + " - 설치 실패 (인터넷 연결 확인)");
+                else sb.AppendLine("✖ " + line);
+            }
+            if (anyOk) sb.AppendLine("\n새 언어가 바로 안 보이면 프로그램을 한 번 껐다 켜 주세요.");
+            return sb.ToString();
+        }
+
+        static void Finish(Form f, string result)
+        {
+            bool ok;
+            string msg = Summarize(result, out ok);
+            running = false;
+            if (ok) OcrService.ResetEngines();
+            bool alive = f != null && !f.IsDisposed;
+            if (alive) MessageBox.Show(f, msg, "OCR 언어 설치", MessageBoxButtons.OK, ok ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+            else MessageBox.Show(msg, "OCR 언어 설치", MessageBoxButtons.OK, ok ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+            if (alive) f.Close();
+        }
+
+        static void StartInstall(List<LangPack> sel, Form f, Label status, Button btn)
+        {
+            string log = Path.Combine(Path.GetTempPath(), "st_ocr_install.log");
+            try { if (File.Exists(log)) File.Delete(log); } catch { }
+            string b64 = Convert.ToBase64String(Encoding.Unicode.GetBytes(BuildScript(sel, log)));
+            ProcessStartInfo psi = new ProcessStartInfo("powershell.exe",
+                "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand " + b64);
+            psi.UseShellExecute = true;
+            psi.Verb = "runas";
+            psi.WindowStyle = ProcessWindowStyle.Hidden;
+            Process proc;
+            try { proc = Process.Start(psi); }
+            catch (Exception ex)
+            {
+                btn.Enabled = true;
+                status.Text = "";
+                MessageBox.Show(f, "관리자 권한을 허용하지 않았거나 설치를 시작하지 못했어요.\n(" + ex.Message + ")", "OCR 언어 설치");
+                return;
+            }
+            running = true;
+            btn.Enabled = false;
+            status.Text = "설치 중... 관리자 권한 확인 창이 뜨면 '예'를 눌러 주세요. 몇 분 걸릴 수 있어요.";
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try { if (proc != null) proc.WaitForExit(30 * 60 * 1000); } catch { }
+                string result = "";
+                try { if (File.Exists(log)) result = File.ReadAllText(log); } catch { }
+                bool posted = false;
+                try
+                {
+                    if (f != null && !f.IsDisposed)
+                    {
+                        f.BeginInvoke((Action)delegate { Finish(f, result); });
+                        posted = true;
+                    }
+                }
+                catch { }
+                if (!posted) Finish(null, result);
+            });
+        }
+
+        public static void Show(IWin32Window owner)
+        {
+            if (running)
+            {
+                MessageBox.Show("지금 설치 중이에요. 끝날 때까지 잠시만 기다려 주세요.", "OCR 언어 설치");
+                return;
+            }
+            List<string> have = OcrService.Languages();
+            List<LangPack> shown = new List<LangPack>();
+            using (Form f = new Form())
+            {
+                f.Text = "OCR 언어 설치";
+                f.Font = new Font("Malgun Gothic", 9f);
+                f.FormBorderStyle = FormBorderStyle.FixedDialog;
+                f.StartPosition = FormStartPosition.CenterScreen;
+                f.MaximizeBox = false;
+                f.MinimizeBox = false;
+                f.ShowInTaskbar = false;
+                f.TopMost = true;
+                f.ClientSize = new Size(440, 470);
+
+                Label info = new Label();
+                info.Text = "글자를 읽으려면(OCR) 그 언어의 언어팩이 Windows 에 설치돼 있어야 해요.\n읽고 싶은 언어를 체크하고 설치를 누르세요. 설치 전에 한 번 더 확인해요.";
+                info.SetBounds(14, 12, 412, 40);
+                f.Controls.Add(info);
+
+                CheckedListBox clb = new CheckedListBox();
+                clb.CheckOnClick = true;
+                clb.IntegralHeight = false;
+                clb.SetBounds(14, 58, 412, 300);
+                foreach (LangPack p in Packs)
+                {
+                    bool inst = IsInstalled(p, have);
+                    shown.Add(p);
+                    clb.Items.Add(p.Name + "  (" + p.Cap + ")" + (inst ? "   - 설치됨" : ""));
+                }
+                clb.ItemCheck += delegate (object s, ItemCheckEventArgs e)
+                {
+                    if (e.NewValue == CheckState.Checked && IsInstalled(shown[e.Index], have)) e.NewValue = CheckState.Unchecked;
+                };
+                f.Controls.Add(clb);
+
+                Label status = new Label();
+                status.ForeColor = SystemColors.GrayText;
+                status.SetBounds(14, 366, 412, 40);
+                f.Controls.Add(status);
+
+                Button go = new Button();
+                go.Text = "선택한 언어 설치";
+                go.SetBounds(14, 420, 150, 32);
+                go.Click += delegate
+                {
+                    List<LangPack> sel = new List<LangPack>();
+                    for (int i = 0; i < clb.Items.Count; i++)
+                        if (clb.GetItemChecked(i)) sel.Add(shown[i]);
+                    if (sel.Count == 0)
+                    {
+                        MessageBox.Show(f, "설치할 언어를 체크해 주세요.", "OCR 언어 설치");
+                        return;
+                    }
+                    StringBuilder names = new StringBuilder();
+                    foreach (LangPack p in sel) names.AppendLine("  • " + p.Name);
+                    string q = "다음 OCR 언어팩을 설치할까요?\n\n" + names +
+                               "\n• Windows 가 인터넷에서 내려받아 설치해요 (언어당 수 MB).\n" +
+                               "• 곧 '관리자 권한 확인' 창이 떠요. 허용해야 설치돼요.";
+                    if (MessageBox.Show(f, q, "OCR 언어 설치", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+                    StartInstall(sel, f, status, go);
+                };
+                f.Controls.Add(go);
+
+                Button close = new Button();
+                close.Text = "닫기";
+                close.SetBounds(340, 420, 86, 32);
+                close.DialogResult = DialogResult.Cancel;
+                f.Controls.Add(close);
+                f.CancelButton = close;
+
+                if (owner != null) f.ShowDialog(owner); else f.ShowDialog();
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ app info / self update
     static class AppInfo
     {
-        public const int AppVersion = 5;
+        public const int AppVersion = 6;
 
         public static string DataDir()
         {
@@ -1789,7 +2139,11 @@ namespace ScreenTranslatorApp
             if (code != 0 || !File.Exists(outPath))
             {
                 Log("build failed for v" + ver + ":\r\n" + output);
-                msg = "새 버전 빌드에 실패했어요 (update.log 참고)";
+                string firstErr = "";
+                foreach (string ol in output.Split('\n'))
+                    if (ol.IndexOf("error CS", StringComparison.Ordinal) >= 0) { firstErr = ol.Trim(); break; }
+                if (firstErr.Length > 150) firstErr = firstErr.Substring(firstErr.Length - 150);
+                msg = "새 버전(v" + ver + ") 빌드에 실패했어요. " + firstErr;
                 return -2;
             }
 
@@ -1822,7 +2176,7 @@ namespace ScreenTranslatorApp
     // ------------------------------------------------------------------ main panel (버튼 UI)
     class MainPanel : Form
     {
-        public Action RegionClicked, LiveClicked, FullClicked, ClearClicked, SettingsClicked, HiddenToTray;
+        public Action RegionClicked, LiveClicked, FullClicked, ClearClicked, SettingsClicked, LangClicked, HiddenToTray;
         public bool ExcludedFromCapture;
         Button bLive;
         Label lbStatus;
@@ -1835,7 +2189,7 @@ namespace ScreenTranslatorApp
 
         public MainPanel()
         {
-            Text = "화면 번역기";
+            Text = "화면 번역기 v" + AppInfo.AppVersion;
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             StartPosition = FormStartPosition.Manual;
@@ -1848,7 +2202,7 @@ namespace ScreenTranslatorApp
             Location = new Point(Math.Max(wa.Left, wa.Right - Width - 24), wa.Top + 80);
 
             Label title = new Label();
-            title.Text = "화면 번역기";
+            title.Text = "화면 번역기  v" + AppInfo.AppVersion;
             title.Font = new Font("Malgun Gothic", 15f, FontStyle.Bold);
             title.ForeColor = Fg;
             title.SetBounds(18, 14, 264, 30);
@@ -1864,13 +2218,15 @@ namespace ScreenTranslatorApp
             bLive = MakeButton("영역 실시간 번역", 132, 46, BtnBg, 10.5f, delegate { if (LiveClicked != null) LiveClicked(); });
             Button bFull = MakeButton("화면 전체 번역", 186, 46, BtnBg, 10.5f, delegate { if (FullClicked != null) FullClicked(); });
             Button bClear = MakeButton("번역 지우기 / 중지", 240, 40, BtnBg, 9.5f, delegate { if (ClearClicked != null) ClearClicked(); });
-            Button bSet = MakeButton("설정", 290, 36, BtnBg, 9.5f, delegate { if (SettingsClicked != null) SettingsClicked(); });
+            Button bSet = MakeButtonAt("설정", 18, 290, 128, 36, BtnBg, 9.5f, delegate { if (SettingsClicked != null) SettingsClicked(); });
+            Button bLang = MakeButtonAt("OCR 언어 설치", 154, 290, 128, 36, BtnBg, 9.5f, delegate { if (LangClicked != null) LangClicked(); });
 
             ToolTip tip = new ToolTip();
             tip.SetToolTip(bRegion, "단축키: Ctrl+Alt+T");
             tip.SetToolTip(bLive, "단축키: Ctrl+Alt+L");
             tip.SetToolTip(bFull, "단축키: Ctrl+Alt+F");
             tip.SetToolTip(bClear, "단축키: Ctrl+Alt+X");
+            tip.SetToolTip(bLang, "읽을 수 없는 언어의 OCR 언어팩을 설치해요 (설치 전에 확인해요)");
 
             lbStatus = new Label();
             lbStatus.Text = "준비됨";
@@ -1888,9 +2244,14 @@ namespace ScreenTranslatorApp
 
         Button MakeButton(string text, int y, int h, Color bg, float size, Action click)
         {
+            return MakeButtonAt(text, 18, y, 264, h, bg, size, click);
+        }
+
+        Button MakeButtonAt(string text, int x, int y, int w, int h, Color bg, float size, Action click)
+        {
             Button b = new Button();
             b.Text = text;
-            b.SetBounds(18, y, 264, h);
+            b.SetBounds(x, y, w, h);
             b.FlatStyle = FlatStyle.Flat;
             b.FlatAppearance.BorderSize = 0;
             b.FlatAppearance.MouseOverBackColor = ControlPaint.Light(bg, 0.25f);
@@ -2099,13 +2460,9 @@ namespace ScreenTranslatorApp
             bU2.Click += delegate { editUrl(); };
             g3.Controls.Add(bU2);
             Button bU3 = new Button();
-            bU3.Text = "OCR 언어 보기";
+            bU3.Text = "OCR 언어 설치...";
             bU3.SetBounds(290, 78, 128, 28);
-            bU3.Click += delegate
-            {
-                List<string> l = OcrService.Languages();
-                MessageBox.Show(this, l.Count == 0 ? "설치된 OCR 언어가 없어요.\n설정 > 시간 및 언어 > 언어 및 지역에서 추가해 주세요." : string.Join(", ", l.ToArray()), "OCR 언어");
-            };
+            bU3.Click += delegate { LangInstaller.Show(this); };
             g3.Controls.Add(bU3);
             Label ver = new Label();
             ver.Text = "현재 버전: v" + AppInfo.AppVersion;
@@ -2132,6 +2489,8 @@ namespace ScreenTranslatorApp
     class TrayForm : Form
     {
         Settings st;
+        Action balloonAct;
+        DateTime balloonAt = DateTime.MinValue, langHintAt = DateTime.MinValue;
         NotifyIcon notify;
         ContextMenuStrip menu;
         ToolStripMenuItem miLive;
@@ -2166,6 +2525,7 @@ namespace ScreenTranslatorApp
             panel.FullClicked = delegate { Post(StartFull); };
             panel.ClearClicked = delegate { Post(StopAll); };
             panel.SettingsClicked = delegate { Post(ShowSettings); };
+            panel.LangClicked = delegate { Post(ShowLangInstaller); };
             panel.HiddenToTray = delegate
             {
                 if (hintShown) return;
@@ -2183,6 +2543,12 @@ namespace ScreenTranslatorApp
             {
                 if (e.Button == MouseButtons.Left) Post(ShowPanel);
             };
+            notify.BalloonTipClicked += delegate
+            {
+                Action a = balloonAct;
+                balloonAct = null;
+                if (a != null && (DateTime.UtcNow - balloonAt).TotalSeconds < 60) Post(a);
+            };
             notify.Visible = true;
 
             liveTimer = new System.Windows.Forms.Timer();
@@ -2199,7 +2565,7 @@ namespace ScreenTranslatorApp
             if (Program.JustUpdated)
                 Notify("화면 번역기", "v" + AppInfo.AppVersion + " 로 업데이트됐어요");
             if (OcrService.Languages().Count == 0)
-                Notify("OCR 언어팩 없음", "설정 > 시간 및 언어 > 언어 및 지역에서 번역할 언어를 추가해 주세요");
+                NotifyAct("OCR 언어팩이 없어요", "여기를 누르면 OCR 언어팩을 설치할 수 있어요", ShowLangInstaller);
 
             if (!Program.Autostart)
             {
@@ -2265,6 +2631,19 @@ namespace ScreenTranslatorApp
             try { notify.ShowBalloonTip(4000, title, text, ToolTipIcon.Info); } catch { }
         }
 
+        void NotifyAct(string title, string text, Action act)
+        {
+            balloonAct = act;
+            balloonAt = DateTime.UtcNow;
+            Notify(title, text);
+        }
+
+        void ShowLangInstaller()
+        {
+            LangInstaller.Show(null);
+            lastSig = null;
+        }
+
         void ShowPanel()
         {
             panel.Show();
@@ -2293,6 +2672,7 @@ namespace ScreenTranslatorApp
             menu.Items.Add(MI("현재 화면 전체 번역  (Ctrl+Alt+F)", delegate { Post(StartFull); }));
             menu.Items.Add(MI("번역 지우기 / 실시간 중지  (Ctrl+Alt+X)", delegate { Post(StopAll); }));
             menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(MI("OCR 언어 설치...", delegate { Post(ShowLangInstaller); }));
             menu.Items.Add(MI("설정...", delegate { Post(ShowSettings); }));
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(MI("종료", delegate { Close(); }));
@@ -2571,6 +2951,12 @@ namespace ScreenTranslatorApp
                             bye.Interval = err.Length > 0 ? 6000 : 2500;
                             bye.Tick += delegate { bye.Stop(); bye.Dispose(); if (id == jobId) CloseOverlay(); };
                             bye.Start();
+                            // 글자를 못 읽었을 때: 다른 언어라면 OCR 언어팩이 없어서일 수 있어요 (5분에 한 번만 알려줘요)
+                            if (err.Length == 0 && (DateTime.UtcNow - langHintAt).TotalMinutes > 5)
+                            {
+                                langHintAt = DateTime.UtcNow;
+                                NotifyAct("번역할 글자를 찾지 못했어요", "다른 언어의 글자라면 OCR 언어팩이 없어서일 수 있어요. 여기를 누르면 설치할 수 있어요", ShowLangInstaller);
+                            }
                         }
                         else if (st.AutoClear) watchTimer.Start();
                     }
