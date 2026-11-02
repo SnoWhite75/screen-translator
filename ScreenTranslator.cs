@@ -50,6 +50,7 @@ namespace ScreenTranslatorApp
         public string UpdateUrl = "https://raw.githubusercontent.com/SnoWhite75/screen-translator/main/";
         public bool AutoUpdate = true;
         public int FailedVersion = 0;
+        public string DeepLKey = "";
 
         static string FilePath()
         {
@@ -77,6 +78,7 @@ namespace ScreenTranslatorApp
                             case "updateurl": if (v.Length > 0) s.UpdateUrl = v; break;
                             case "autoupdate": s.AutoUpdate = v == "1"; break;
                             case "failedver": int.TryParse(v, out s.FailedVersion); break;
+                            case "deeplkey": s.DeepLKey = v; break;
                         }
                     }
                 }
@@ -97,6 +99,7 @@ namespace ScreenTranslatorApp
                 l.Add("updateurl=" + UpdateUrl);
                 l.Add("autoupdate=" + (AutoUpdate ? "1" : "0"));
                 l.Add("failedver=" + FailedVersion);
+                l.Add("deeplkey=" + DeepLKey);
                 File.WriteAllLines(p, l.ToArray(), Encoding.UTF8);
             }
             catch { }
@@ -210,14 +213,32 @@ namespace ScreenTranslatorApp
     {
         public static Http Send(string url)
         {
+            return Request("GET", url, null, null);
+        }
+
+        public static Http Post(string url, string form, string authorization)
+        {
+            return Request("POST", url, form, authorization);
+        }
+
+        static Http Request(string method, string url, string body, string authorization)
+        {
             Http res = new Http();
             try
             {
                 HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
-                req.Method = "GET";
+                req.Method = method;
                 req.Timeout = 15000;
                 req.ReadWriteTimeout = 15000;
                 req.UserAgent = "Mozilla/5.0 ScreenTranslator/1.0";
+                if (authorization != null) req.Headers["Authorization"] = authorization;
+                if (body != null)
+                {
+                    byte[] data = Encoding.UTF8.GetBytes(body);
+                    req.ContentType = "application/x-www-form-urlencoded; charset=UTF-8";
+                    req.ContentLength = data.Length;
+                    using (Stream rs = req.GetRequestStream()) rs.Write(data, 0, data.Length);
+                }
                 using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse()) Fill(res, resp);
             }
             catch (WebException ex)
@@ -241,10 +262,21 @@ namespace ScreenTranslatorApp
     }
 
     // ------------------------------------------------------------------ translation
+    // 한 화면의 문단을 "요청 1번"으로 묶어서 보내고, 요청은 한 번에 하나씩만 보내요.
+    // 그래도 제한(429)이 걸리면 잠시 쉬었다가 자동으로 다시 시도해요.
     static class Translator
     {
         static Dictionary<string, string> cache = new Dictionary<string, string>();
+        static readonly object gate = new object();
+        static DateTime nextAllowed = DateTime.MinValue;
+        static DateTime googleBlockedUntil = DateTime.MinValue;
+        static int strikes = 0;
+        static bool lastGoogleMismatch = false;
+        static string lastDeepLError = "";
+
         public static string LastError = "";
+        public static string DeepLKey = "";
+        public static string Engine = "";
 
         public static double HangulRatio(string s)
         {
@@ -266,19 +298,133 @@ namespace ScreenTranslatorApp
             return HangulRatio(s) < 0.5;
         }
 
-        // returns null if no translation is needed or it failed
-        public static string ToKorean(string text)
+        public static int CooldownSeconds()
         {
-            string hit;
-            lock (cache) { if (cache.TryGetValue(text, out hit)) return hit.Length == 0 ? null : hit; }
-            string result = "";
+            double s = (googleBlockedUntil - DateTime.UtcNow).TotalSeconds;
+            return s > 0 ? (int)Math.Ceiling(s) : 0;
+        }
+
+        public static void ResetCooldown()
+        {
+            googleBlockedUntil = DateTime.MinValue;
+            strikes = 0;
+        }
+
+        static void Throttle(int gapMs)
+        {
+            DateTime now = DateTime.UtcNow;
+            if (nextAllowed > now) Thread.Sleep((int)(nextAllowed - now).TotalMilliseconds);
+            nextAllowed = DateTime.UtcNow.AddMilliseconds(gapMs);
+        }
+
+        // 번역이 필요 없거나 실패한 항목은 null. 실패 이유는 LastError 에 남아요.
+        public static string[] ToKorean(List<string> texts)
+        {
+            string[] result = new string[texts.Count];
+            List<int> miss = new List<int>();
+            lock (cache)
+            {
+                for (int i = 0; i < texts.Count; i++)
+                {
+                    string hit;
+                    if (cache.TryGetValue(texts[i], out hit)) result[i] = hit.Length == 0 ? null : hit;
+                    else miss.Add(i);
+                }
+            }
+            if (miss.Count == 0) { LastError = ""; return result; }
+
+            lock (gate)
+            {
+                int pos = 0;
+                while (pos < miss.Count)
+                {
+                    List<int> idx = new List<int>();
+                    int chars = 0;
+                    while (pos < miss.Count)
+                    {
+                        int len = texts[miss[pos]].Length + 1;
+                        if (idx.Count > 0 && (chars + len > 3500 || idx.Count >= 40)) break;
+                        idx.Add(miss[pos]);
+                        chars += len;
+                        pos++;
+                    }
+                    List<string> part = new List<string>();
+                    foreach (int i in idx) part.Add(texts[i]);
+                    string[] outp = TranslateChunk(part);
+                    if (outp == null) return result; // 실패: 지금까지 된 것만 돌려줘요 (이유는 LastError)
+                    lock (cache)
+                    {
+                        if (cache.Count > 3000) cache.Clear();
+                        for (int k = 0; k < idx.Count; k++)
+                        {
+                            string o = outp[k] ?? "";
+                            if (string.Equals(o.Trim(), texts[idx[k]].Trim(), StringComparison.OrdinalIgnoreCase)) o = "";
+                            cache[texts[idx[k]]] = o;
+                            result[idx[k]] = o.Length == 0 ? null : o;
+                        }
+                    }
+                }
+            }
+            LastError = "";
+            return result;
+        }
+
+        static string[] TranslateChunk(List<string> part)
+        {
+            string[] r;
+            if (DeepLKey.Length > 0)
+            {
+                r = ViaDeepL(part);
+                if (r != null) { Engine = "DeepL"; return r; }
+            }
+            int cd = CooldownSeconds();
+            if (cd > 0)
+            {
+                if (DeepLKey.Length == 0 || LastError.Length == 0)
+                    LastError = "번역 서버가 요청 제한으로 잠시 쉬는 중이에요 (" + cd + "초 뒤 자동 재시도)";
+                return null;
+            }
+            r = ViaGoogle(part);
+            if (r != null) Engine = "Google";
+            return r;
+        }
+
+        // ---------- Google (무료, 비공식) ----------
+        static string[] ViaGoogle(List<string> part)
+        {
+            string joined = string.Join("\n", part.ToArray());
+            string[] r = GoogleRequest(joined, part.Count);
+            if (r != null || part.Count == 1 || !lastGoogleMismatch) return r;
+            // 줄 수가 맞지 않으면 한 줄씩 (천천히) 다시 해봐요
+            string[] single = new string[part.Count];
+            for (int i = 0; i < part.Count; i++)
+            {
+                string[] one = GoogleRequest(part[i], 1);
+                if (one == null) return null;
+                single[i] = one[0];
+            }
+            return single;
+        }
+
+        static string[] GoogleRequest(string text, int expect)
+        {
+            lastGoogleMismatch = false;
+            string baseUrl = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ko&dt=t";
+            string enc = Uri.EscapeDataString(text);
             for (int attempt = 0; attempt < 2; attempt++)
             {
-                Http r = Fetcher.Send("https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ko&dt=t&q=" +
-                                      Uri.EscapeDataString(text));
-                if (r.Error != null) { LastError = "네트워크 오류"; continue; }
-                if (r.Status == 429) { LastError = "번역 요청이 너무 많아요. 잠시 후 다시 시도해 주세요"; Thread.Sleep(400); continue; }
-                if (r.Status != 200) { LastError = "번역 서버 오류 (" + r.Status + ")"; continue; }
+                Throttle(600);
+                Http r = enc.Length <= 1500 ? Fetcher.Send(baseUrl + "&q=" + enc) : Fetcher.Post(baseUrl, "q=" + enc, null);
+                if (r.Error != null) { LastError = "인터넷에 연결할 수 없어요"; Thread.Sleep(300); continue; }
+                if (r.Status == 429 || r.Status == 503)
+                {
+                    strikes++;
+                    int wait = (int)(20 * Math.Pow(2, Math.Min(strikes, 5) - 1)); // 20초 → 40 → 80 → 160 → 320초
+                    googleBlockedUntil = DateTime.UtcNow.AddSeconds(wait);
+                    LastError = "Google 무료 번역이 요청 제한을 걸었어요. " + wait + "초 쉬었다가 자동으로 다시 시도해요 (설정에서 DeepL 키를 넣으면 거의 안 생겨요)";
+                    return null;
+                }
+                if (r.Status != 200) { LastError = "번역 서버 오류 (" + r.Status + ")"; Thread.Sleep(300); continue; }
                 try
                 {
                     List<object> root = MiniJson.Parse(r.Body) as List<object>;
@@ -289,16 +435,86 @@ namespace ScreenTranslatorApp
                         List<object> seg = o as List<object>;
                         if (seg != null && seg.Count > 0 && seg[0] is string) sb.Append((string)seg[0]);
                     }
-                    string lang = (root.Count > 2 ? root[2] as string : null) ?? "";
-                    if (lang == "ko") { result = ""; }
-                    else result = sb.ToString().Trim();
+                    string all = sb.ToString().Replace("\r", "");
+                    strikes = 0;
                     LastError = "";
-                    lock (cache) { if (cache.Count > 3000) cache.Clear(); cache[text] = result; }
-                    return result.Length == 0 ? null : result;
+                    if (expect == 1) return new string[] { all.Replace("\n", " ").Trim() };
+                    List<string> ls = new List<string>(all.Split('\n'));
+                    while (ls.Count > expect && ls[ls.Count - 1].Trim().Length == 0) ls.RemoveAt(ls.Count - 1);
+                    if (ls.Count != expect)
+                    {
+                        lastGoogleMismatch = true;
+                        LastError = "번역 결과의 줄 수가 맞지 않아요";
+                        return null;
+                    }
+                    for (int i = 0; i < ls.Count; i++) ls[i] = ls[i].Trim();
+                    return ls.ToArray();
                 }
-                catch { LastError = "번역 응답을 해석하지 못했어요"; }
+                catch
+                {
+                    LastError = "번역 응답을 해석하지 못했어요";
+                    return null;
+                }
             }
             return null;
+        }
+
+        // ---------- DeepL (선택, 무료 API 키) ----------
+        static string[] ViaDeepL(List<string> part)
+        {
+            string host = DeepLKey.EndsWith(":fx") ? "https://api-free.deepl.com" : "https://api.deepl.com";
+            StringBuilder body = new StringBuilder("target_lang=KO");
+            foreach (string t in part) body.Append("&text=").Append(Uri.EscapeDataString(t));
+            Throttle(250);
+            Http r = Fetcher.Post(host + "/v2/translate", body.ToString(), "DeepL-Auth-Key " + DeepLKey);
+            string err = null;
+            if (r.Error != null) err = "DeepL 서버에 연결하지 못했어요";
+            else if (r.Status == 403) err = "DeepL 키가 올바르지 않아요";
+            else if (r.Status == 456) err = "DeepL 이번 달 무료 한도를 모두 썼어요";
+            else if (r.Status == 429) err = "DeepL 요청이 너무 많아요";
+            else if (r.Status != 200) err = "DeepL 서버 오류 (" + r.Status + ")";
+            if (err == null)
+            {
+                try
+                {
+                    Dictionary<string, object> root = MiniJson.Parse(r.Body) as Dictionary<string, object>;
+                    List<object> list = root["translations"] as List<object>;
+                    if (list.Count == part.Count)
+                    {
+                        string[] res = new string[part.Count];
+                        for (int i = 0; i < list.Count; i++)
+                        {
+                            Dictionary<string, object> d = list[i] as Dictionary<string, object>;
+                            string lang = d.ContainsKey("detected_source_language") ? (d["detected_source_language"] as string) : "";
+                            res[i] = (lang == "KO") ? "" : ((d["text"] as string) ?? "").Trim();
+                        }
+                        lastDeepLError = "";
+                        LastError = "";
+                        return res;
+                    }
+                    err = "DeepL 응답의 개수가 맞지 않아요";
+                }
+                catch { err = "DeepL 응답을 해석하지 못했어요"; }
+            }
+            lastDeepLError = err;
+            LastError = err;
+            return null;
+        }
+
+        // 설정 화면의 "번역 테스트"용 (캐시를 거치지 않고 실제로 요청해요)
+        public static string Test(out bool ok)
+        {
+            ok = false;
+            lock (gate)
+            {
+                lastDeepLError = "";
+                string[] r = TranslateChunk(new List<string>(new string[] { "Hello, world! This is a translation test." }));
+                ok = r != null && r.Length > 0 && !string.IsNullOrEmpty(r[0]);
+                string msg = ok ? "[" + Engine + "] " + r[0] : LastError;
+                if (DeepLKey.Length > 0 && lastDeepLError.Length > 0)
+                    msg += "\n\nDeepL: " + lastDeepLError + (ok ? "  →  Google 로 대신 번역했어요" : "");
+                return msg;
+            }
         }
     }
 
@@ -532,13 +748,9 @@ namespace ScreenTranslatorApp
             List<Para> todo = new List<Para>();
             foreach (Para p in paras) if (Translator.WorthTranslating(p.Text)) todo.Add(p);
 
-            string[] outText = new string[todo.Count];
-            ParallelOptions po = new ParallelOptions();
-            po.MaxDegreeOfParallelism = 6;
-            Parallel.For(0, todo.Count, po, delegate (int i)
-            {
-                outText[i] = Translator.ToKorean(todo[i].Text);
-            });
+            List<string> srcTexts = new List<string>();
+            foreach (Para p in todo) srcTexts.Add(p.Text);
+            string[] outText = todo.Count > 0 ? Translator.ToKorean(srcTexts) : new string[0];
             if (todo.Count > 0 && Translator.LastError.Length > 0) error = Translator.LastError;
 
             List<Item> items = new List<Item>();
@@ -694,6 +906,12 @@ namespace ScreenTranslatorApp
             catch { ExcludedFromCapture = false; }
         }
 
+        public void SetStatus(string st)
+        {
+            status = st;
+            Invalidate();
+        }
+
         public void SetContent(List<Item> list, string st)
         {
             items = list;
@@ -756,7 +974,7 @@ namespace ScreenTranslatorApp
     // ------------------------------------------------------------------ app info / self update
     static class AppInfo
     {
-        public const int AppVersion = 1;
+        public const int AppVersion = 2;
 
         public static string DataDir()
         {
@@ -936,17 +1154,285 @@ namespace ScreenTranslatorApp
         }
     }
 
+    // ------------------------------------------------------------------ main panel (버튼 UI)
+    class MainPanel : Form
+    {
+        public Action RegionClicked, LiveClicked, FullClicked, ClearClicked, SettingsClicked, HiddenToTray;
+        public bool ExcludedFromCapture;
+        Button bLive;
+        Label lbStatus;
+
+        static readonly Color Bg = Color.FromArgb(24, 28, 34);
+        static readonly Color BtnBg = Color.FromArgb(46, 53, 64);
+        static readonly Color Accent = Color.FromArgb(255, 98, 52);
+        static readonly Color Fg = Color.FromArgb(236, 240, 244);
+        static readonly Color Dim = Color.FromArgb(150, 160, 172);
+
+        public MainPanel()
+        {
+            Text = "화면 번역기";
+            FormBorderStyle = FormBorderStyle.FixedSingle;
+            MaximizeBox = false;
+            StartPosition = FormStartPosition.Manual;
+            TopMost = true;
+            BackColor = Bg;
+            ForeColor = Fg;
+            Font = new Font("Malgun Gothic", 9.5f);
+            ClientSize = new Size(300, 392);
+            Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+            Location = new Point(Math.Max(wa.Left, wa.Right - Width - 24), wa.Top + 80);
+
+            Label title = new Label();
+            title.Text = "화면 번역기";
+            title.Font = new Font("Malgun Gothic", 15f, FontStyle.Bold);
+            title.ForeColor = Fg;
+            title.SetBounds(18, 14, 264, 30);
+            Controls.Add(title);
+
+            Label sub = new Label();
+            sub.Text = "화면 속 외국어를 한국어로 바꿔 보여줘요";
+            sub.ForeColor = Dim;
+            sub.SetBounds(20, 46, 262, 20);
+            Controls.Add(sub);
+
+            Button bRegion = MakeButton("영역 선택해서 번역", 78, 46, Accent, 10.5f, delegate { if (RegionClicked != null) RegionClicked(); });
+            bLive = MakeButton("영역 실시간 번역", 132, 46, BtnBg, 10.5f, delegate { if (LiveClicked != null) LiveClicked(); });
+            Button bFull = MakeButton("화면 전체 번역", 186, 46, BtnBg, 10.5f, delegate { if (FullClicked != null) FullClicked(); });
+            Button bClear = MakeButton("번역 지우기 / 중지", 240, 40, BtnBg, 9.5f, delegate { if (ClearClicked != null) ClearClicked(); });
+            Button bSet = MakeButton("설정", 290, 36, BtnBg, 9.5f, delegate { if (SettingsClicked != null) SettingsClicked(); });
+
+            ToolTip tip = new ToolTip();
+            tip.SetToolTip(bRegion, "단축키: Ctrl+Alt+T");
+            tip.SetToolTip(bLive, "단축키: Ctrl+Alt+L");
+            tip.SetToolTip(bFull, "단축키: Ctrl+Alt+F");
+            tip.SetToolTip(bClear, "단축키: Ctrl+Alt+X");
+
+            lbStatus = new Label();
+            lbStatus.Text = "준비됨";
+            lbStatus.ForeColor = Dim;
+            lbStatus.SetBounds(18, 336, 264, 34);
+            Controls.Add(lbStatus);
+
+            Label hint = new Label();
+            hint.Text = "단축키  Ctrl+Alt+  T 영역 · L 실시간 · F 전체 · X 지우기";
+            hint.Font = new Font("Malgun Gothic", 8f);
+            hint.ForeColor = Dim;
+            hint.SetBounds(18, 372, 270, 16);
+            Controls.Add(hint);
+        }
+
+        Button MakeButton(string text, int y, int h, Color bg, float size, Action click)
+        {
+            Button b = new Button();
+            b.Text = text;
+            b.SetBounds(18, y, 264, h);
+            b.FlatStyle = FlatStyle.Flat;
+            b.FlatAppearance.BorderSize = 0;
+            b.FlatAppearance.MouseOverBackColor = ControlPaint.Light(bg, 0.25f);
+            b.BackColor = bg;
+            b.ForeColor = Color.White;
+            b.Font = new Font("Malgun Gothic", size, FontStyle.Bold);
+            b.Cursor = Cursors.Hand;
+            b.UseVisualStyleBackColor = false;
+            b.Click += delegate { click(); };
+            Controls.Add(b);
+            return b;
+        }
+
+        public void SetLive(bool on)
+        {
+            bLive.Text = on ? "실시간 번역 중지" : "영역 실시간 번역";
+            Color c = on ? Color.FromArgb(200, 60, 40) : BtnBg;
+            bLive.BackColor = c;
+            bLive.FlatAppearance.MouseOverBackColor = ControlPaint.Light(c, 0.25f);
+        }
+
+        public void SetStatus(string s)
+        {
+            lbStatus.Text = s;
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            try { ExcludedFromCapture = Native.SetWindowDisplayAffinity(Handle, Native.WDA_EXCLUDEFROMCAPTURE); }
+            catch { ExcludedFromCapture = false; }
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                Hide();
+                if (HiddenToTray != null) HiddenToTray();
+                return;
+            }
+            base.OnFormClosing(e);
+        }
+    }
+
+    // ------------------------------------------------------------------ settings window
+    class SettingsForm : Form
+    {
+        ComboBox cbInterval;
+        TextBox tbKey;
+        CheckBox ckAuto, ckUpd;
+        int[] intervals = { 1000, 1500, 3000, 5000 };
+
+        public int IntervalMs { get { return intervals[Math.Max(0, cbInterval.SelectedIndex)]; } }
+        public string DeepLKeyValue { get { return tbKey.Text.Trim(); } }
+        public bool AutoStartValue { get { return ckAuto.Checked; } }
+        public bool AutoUpdateValue { get { return ckUpd.Checked; } }
+
+        public SettingsForm(Settings st, bool autoStart, Action checkUpdate, Action editUrl)
+        {
+            Text = "화면 번역기 설정";
+            Font = new Font("Malgun Gothic", 9f);
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            StartPosition = FormStartPosition.CenterScreen;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            ClientSize = new Size(460, 478);
+
+            // --- 실시간 번역
+            GroupBox g1 = new GroupBox();
+            g1.Text = "실시간 번역";
+            g1.SetBounds(14, 10, 432, 64);
+            Controls.Add(g1);
+            Label l1 = new Label();
+            l1.Text = "화면 확인 주기";
+            l1.SetBounds(14, 30, 110, 20);
+            g1.Controls.Add(l1);
+            cbInterval = new ComboBox();
+            cbInterval.DropDownStyle = ComboBoxStyle.DropDownList;
+            cbInterval.Items.AddRange(new object[] { "1초", "1.5초", "3초", "5초" });
+            cbInterval.SetBounds(130, 26, 110, 24);
+            int sel = 1, best = int.MaxValue;
+            for (int i = 0; i < intervals.Length; i++)
+            {
+                int d = Math.Abs(intervals[i] - st.LiveIntervalMs);
+                if (d < best) { best = d; sel = i; }
+            }
+            cbInterval.SelectedIndex = sel;
+            g1.Controls.Add(cbInterval);
+            Label l1b = new Label();
+            l1b.Text = "화면이 바뀔 때만 번역해요";
+            l1b.ForeColor = SystemColors.GrayText;
+            l1b.SetBounds(250, 30, 170, 20);
+            g1.Controls.Add(l1b);
+
+            // --- 번역 엔진
+            GroupBox g2 = new GroupBox();
+            g2.Text = "번역 엔진";
+            g2.SetBounds(14, 84, 432, 186);
+            Controls.Add(g2);
+            Label l2 = new Label();
+            l2.Text = "기본은 Google 무료 번역이에요. '요청 제한' 오류가 자주 나면 DeepL 무료 API 키를 넣어 주세요 (월 50만 자 무료). 키는 이 PC에만 저장돼요.";
+            l2.SetBounds(14, 22, 404, 52);
+            g2.Controls.Add(l2);
+            Label l2b = new Label();
+            l2b.Text = "DeepL 키";
+            l2b.SetBounds(14, 84, 70, 20);
+            g2.Controls.Add(l2b);
+            tbKey = new TextBox();
+            tbKey.UseSystemPasswordChar = true;
+            tbKey.Text = st.DeepLKey;
+            tbKey.SetBounds(90, 80, 328, 24);
+            g2.Controls.Add(tbKey);
+            LinkLabel lk = new LinkLabel();
+            lk.Text = "DeepL API 키 발급 페이지 열기";
+            lk.SetBounds(14, 112, 250, 20);
+            lk.LinkClicked += delegate
+            {
+                try { Process.Start("https://www.deepl.com/pro-api"); } catch { }
+            };
+            g2.Controls.Add(lk);
+            Button bTest = new Button();
+            bTest.Text = "번역 테스트";
+            bTest.SetBounds(14, 142, 120, 30);
+            bTest.Click += delegate
+            {
+                Translator.DeepLKey = tbKey.Text.Trim();
+                Translator.ResetCooldown();
+                Cursor = Cursors.WaitCursor;
+                bool ok;
+                string msg;
+                try { msg = Translator.Test(out ok); }
+                finally { Cursor = Cursors.Default; }
+                MessageBox.Show(this, msg, ok ? "번역 테스트 성공" : "번역 테스트 실패",
+                    MessageBoxButtons.OK, ok ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
+            };
+            g2.Controls.Add(bTest);
+
+            // --- 일반
+            GroupBox g3 = new GroupBox();
+            g3.Text = "일반";
+            g3.SetBounds(14, 280, 432, 144);
+            Controls.Add(g3);
+            ckAuto = new CheckBox();
+            ckAuto.Text = "Windows 시작 시 자동 실행";
+            ckAuto.Checked = autoStart;
+            ckAuto.SetBounds(14, 24, 300, 22);
+            g3.Controls.Add(ckAuto);
+            ckUpd = new CheckBox();
+            ckUpd.Text = "자동 업데이트 (6시간마다 확인)";
+            ckUpd.Checked = st.AutoUpdate;
+            ckUpd.SetBounds(14, 48, 300, 22);
+            g3.Controls.Add(ckUpd);
+            Button bU1 = new Button();
+            bU1.Text = "지금 업데이트 확인";
+            bU1.SetBounds(14, 78, 140, 28);
+            bU1.Click += delegate { checkUpdate(); };
+            g3.Controls.Add(bU1);
+            Button bU2 = new Button();
+            bU2.Text = "업데이트 주소...";
+            bU2.SetBounds(162, 78, 120, 28);
+            bU2.Click += delegate { editUrl(); };
+            g3.Controls.Add(bU2);
+            Button bU3 = new Button();
+            bU3.Text = "OCR 언어 보기";
+            bU3.SetBounds(290, 78, 128, 28);
+            bU3.Click += delegate
+            {
+                List<string> l = OcrService.Languages();
+                MessageBox.Show(this, l.Count == 0 ? "설치된 OCR 언어가 없어요.\n설정 > 시간 및 언어 > 언어 및 지역에서 추가해 주세요." : string.Join(", ", l.ToArray()), "OCR 언어");
+            };
+            g3.Controls.Add(bU3);
+            Label ver = new Label();
+            ver.Text = "현재 버전: v" + AppInfo.AppVersion;
+            ver.ForeColor = SystemColors.GrayText;
+            ver.SetBounds(14, 116, 200, 20);
+            g3.Controls.Add(ver);
+
+            Button ok2 = new Button();
+            ok2.Text = "저장";
+            ok2.SetBounds(270, 436, 86, 30);
+            ok2.DialogResult = DialogResult.OK;
+            Controls.Add(ok2);
+            Button cancel = new Button();
+            cancel.Text = "취소";
+            cancel.SetBounds(362, 436, 86, 30);
+            cancel.DialogResult = DialogResult.Cancel;
+            Controls.Add(cancel);
+            AcceptButton = ok2;
+            CancelButton = cancel;
+        }
+    }
+
     // ------------------------------------------------------------------ tray app
     class TrayForm : Form
     {
         Settings st;
         NotifyIcon notify;
         ContextMenuStrip menu;
-        ToolStripMenuItem miLive, miAuto, miAutoUpd;
+        ToolStripMenuItem miLive;
+        MainPanel panel;
         System.Windows.Forms.Timer liveTimer, updTimer;
 
         OverlayForm overlay;
-        bool liveOn, liveBusy, updBusy, oldCleaned;
+        bool liveOn, liveBusy, updBusy, oldCleaned, hintShown;
         Rectangle liveRect;
         byte[] lastSig;
         int jobId;
@@ -956,6 +1442,7 @@ namespace ScreenTranslatorApp
         public TrayForm()
         {
             st = Settings.Load();
+            Translator.DeepLKey = st.DeepLKey;
             ShowInTaskbar = false;
             FormBorderStyle = FormBorderStyle.None;
             Opacity = 0;
@@ -964,13 +1451,29 @@ namespace ScreenTranslatorApp
             Location = new Point(-32000, -32000);
             IntPtr h = Handle; // 핫키용 핸들 미리 생성
 
+            panel = new MainPanel();
+            panel.RegionClicked = delegate { Post(delegate { StartRegion(false); }); };
+            panel.LiveClicked = delegate { Post(delegate { if (liveOn) StopAll(); else StartRegion(true); }); };
+            panel.FullClicked = delegate { Post(StartFull); };
+            panel.ClearClicked = delegate { Post(StopAll); };
+            panel.SettingsClicked = delegate { Post(ShowSettings); };
+            panel.HiddenToTray = delegate
+            {
+                if (hintShown) return;
+                hintShown = true;
+                Notify("화면 번역기", "창을 닫아도 트레이에서 계속 실행 중이에요. 트레이 아이콘을 누르면 다시 열려요.");
+            };
+
             BuildMenu();
             notify = new NotifyIcon();
             try { notify.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
             catch { notify.Icon = SystemIcons.Application; }
             notify.Text = "화면 번역기";
             notify.ContextMenuStrip = menu;
-            notify.DoubleClick += delegate { Post(delegate { StartRegion(false); }); };
+            notify.MouseClick += delegate (object s, MouseEventArgs e)
+            {
+                if (e.Button == MouseButtons.Left) Post(ShowPanel);
+            };
             notify.Visible = true;
 
             liveTimer = new System.Windows.Forms.Timer();
@@ -983,10 +1486,16 @@ namespace ScreenTranslatorApp
 
             if (Program.JustUpdated)
                 Notify("화면 번역기", "v" + AppInfo.AppVersion + " 로 업데이트됐어요");
-            else
-                Notify("화면 번역기", "Ctrl+Alt+T: 영역 번역 / Ctrl+Alt+L: 실시간 / Ctrl+Alt+F: 전체 화면");
             if (OcrService.Languages().Count == 0)
                 Notify("OCR 언어팩 없음", "설정 > 시간 및 언어 > 언어 및 지역에서 번역할 언어를 추가해 주세요");
+
+            if (!Program.Autostart)
+            {
+                System.Windows.Forms.Timer t = new System.Windows.Forms.Timer();
+                t.Interval = 250;
+                t.Tick += delegate { t.Stop(); t.Dispose(); ShowPanel(); };
+                t.Start();
+            }
         }
 
         protected override void SetVisibleCore(bool value) { base.SetVisibleCore(false); }
@@ -1044,6 +1553,13 @@ namespace ScreenTranslatorApp
             try { notify.ShowBalloonTip(4000, title, text, ToolTipIcon.Info); } catch { }
         }
 
+        void ShowPanel()
+        {
+            panel.Show();
+            if (panel.WindowState == FormWindowState.Minimized) panel.WindowState = FormWindowState.Normal;
+            panel.Activate();
+        }
+
         // ---------- menu ----------
         ToolStripMenuItem MI(string text, EventHandler h)
         {
@@ -1055,53 +1571,20 @@ namespace ScreenTranslatorApp
         void BuildMenu()
         {
             menu = new ContextMenuStrip();
+            ToolStripMenuItem open = MI("화면 번역기 열기", delegate { Post(ShowPanel); });
+            open.Font = new Font(open.Font, FontStyle.Bold);
+            menu.Items.Add(open);
+            menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(MI("영역 선택해서 번역  (Ctrl+Alt+T)", delegate { Post(delegate { StartRegion(false); }); }));
             miLive = MI("영역 실시간 번역  (Ctrl+Alt+L)", delegate { Post(delegate { if (liveOn) StopAll(); else StartRegion(true); }); });
             menu.Items.Add(miLive);
             menu.Items.Add(MI("현재 화면 전체 번역  (Ctrl+Alt+F)", delegate { Post(StartFull); }));
-            menu.Items.Add(MI("번역 지우기 / 실시간 중지  (Ctrl+Alt+X)", delegate { StopAll(); }));
+            menu.Items.Add(MI("번역 지우기 / 실시간 중지  (Ctrl+Alt+X)", delegate { Post(StopAll); }));
             menu.Items.Add(new ToolStripSeparator());
-
-            ToolStripMenuItem iv = new ToolStripMenuItem("실시간 갱신 주기");
-            int[] iu = { 1000, 1500, 3000, 5000 };
-            string[] iname = { "1초", "1.5초", "3초", "5초" };
-            for (int i = 0; i < iu.Length; i++)
-            {
-                int val = iu[i];
-                ToolStripMenuItem it = MI(iname[i], delegate { st.LiveIntervalMs = val; liveTimer.Interval = val; st.Save(); });
-                iv.DropDownItems.Add(it);
-            }
-            menu.Items.Add(iv);
-
-            ToolStripMenuItem langs = MI("설치된 OCR 언어 보기", delegate
-            {
-                List<string> l = OcrService.Languages();
-                MessageBox.Show(l.Count == 0 ? "설치된 OCR 언어가 없어요." : string.Join(", ", l.ToArray()), "OCR 언어");
-            });
-            menu.Items.Add(langs);
-
-            ToolStripMenuItem upd = new ToolStripMenuItem("업데이트");
-            miAutoUpd = MI("자동 업데이트 (6시간마다 확인)", delegate { st.AutoUpdate = !st.AutoUpdate; st.Save(); });
-            upd.DropDownItems.Add(miAutoUpd);
-            upd.DropDownItems.Add(MI("지금 업데이트 확인", delegate { StartUpdateCheck(true); }));
-            upd.DropDownItems.Add(MI("업데이트 주소 설정...", delegate { EditUpdateUrl(); }));
-            upd.DropDownItems.Add(new ToolStripSeparator());
-            ToolStripMenuItem verItem = MI("현재 버전: v" + AppInfo.AppVersion, null);
-            verItem.Enabled = false;
-            upd.DropDownItems.Add(verItem);
-            menu.Items.Add(upd);
-
-            miAuto = MI("Windows 시작 시 자동 실행", delegate { SetAutoStart(!GetAutoStart()); });
-            menu.Items.Add(miAuto);
+            menu.Items.Add(MI("설정...", delegate { Post(ShowSettings); }));
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(MI("종료", delegate { Close(); }));
-
-            menu.Opening += delegate
-            {
-                miLive.Checked = liveOn;
-                miAuto.Checked = GetAutoStart();
-                miAutoUpd.Checked = st.AutoUpdate;
-            };
+            menu.Opening += delegate { miLive.Checked = liveOn; };
         }
 
         const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -1123,11 +1606,36 @@ namespace ScreenTranslatorApp
                 using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RunKey, true))
                 {
                     if (k == null) return;
-                    if (on) k.SetValue("ScreenTranslator", "\"" + Application.ExecutablePath + "\"");
+                    if (on) k.SetValue("ScreenTranslator", "\"" + Application.ExecutablePath + "\" --autostart");
                     else k.DeleteValue("ScreenTranslator", false);
                 }
             }
             catch { }
+        }
+
+        void ShowSettings()
+        {
+            string oldKey = st.DeepLKey;
+            using (SettingsForm f = new SettingsForm(st, GetAutoStart(),
+                delegate { StartUpdateCheck(true); }, delegate { EditUpdateUrl(); }))
+            {
+                f.TopMost = true;
+                if (f.ShowDialog() != DialogResult.OK)
+                {
+                    Translator.DeepLKey = oldKey; // 테스트하면서 바뀐 값 되돌리기
+                    return;
+                }
+                bool keyChanged = f.DeepLKeyValue != oldKey;
+                st.LiveIntervalMs = f.IntervalMs;
+                liveTimer.Interval = st.LiveIntervalMs;
+                st.DeepLKey = f.DeepLKeyValue;
+                Translator.DeepLKey = st.DeepLKey;
+                if (keyChanged) Translator.ResetCooldown();
+                st.AutoUpdate = f.AutoUpdateValue;
+                if (f.AutoStartValue != GetAutoStart()) SetAutoStart(f.AutoStartValue);
+                st.Save();
+                panel.SetStatus("설정을 저장했어요");
+            }
         }
 
         // ---------- capture ----------
@@ -1136,6 +1644,15 @@ namespace ScreenTranslatorApp
             Bitmap b = new Bitmap(r.Width, r.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
             using (Graphics g = Graphics.FromImage(b)) g.CopyFromScreen(r.X, r.Y, 0, 0, r.Size, CopyPixelOperation.SourceCopy);
             return b;
+        }
+
+        // 번역기 창 자체가 캡처에 찍히지 않게 해요
+        Bitmap CaptureClean(Rectangle r)
+        {
+            bool tmp = panel != null && panel.Visible && !panel.ExcludedFromCapture;
+            if (tmp) { panel.Opacity = 0; Application.DoEvents(); Thread.Sleep(80); }
+            try { return CaptureScreen(r); }
+            finally { if (tmp) panel.Opacity = 1; }
         }
 
         static byte[] Signature(Bitmap b)
@@ -1173,6 +1690,8 @@ namespace ScreenTranslatorApp
             liveTimer.Stop();
             jobId++;
             CloseOverlay();
+            panel.SetLive(false);
+            panel.SetStatus("준비됨");
         }
 
         void CloseOverlay()
@@ -1189,7 +1708,7 @@ namespace ScreenTranslatorApp
         {
             StopAll();
             Rectangle vs = SystemInformation.VirtualScreen;
-            Bitmap shot = CaptureScreen(vs);
+            Bitmap shot = CaptureClean(vs);
             Rectangle rect;
             using (SelectForm sf = new SelectForm(shot, vs))
             {
@@ -1214,16 +1733,17 @@ namespace ScreenTranslatorApp
         {
             StopAll();
             Rectangle r = Screen.FromPoint(Cursor.Position).Bounds;
-            Bitmap bmp = CaptureScreen(r);
+            Bitmap bmp = CaptureClean(r);
             BeginOnce(r, bmp);
         }
 
         void BeginOnce(Rectangle rect, Bitmap bmp)
         {
             overlay = new OverlayForm(rect, false);
-            overlay.Dismissed += delegate { CloseOverlay(); };
+            overlay.Dismissed += delegate { CloseOverlay(); panel.SetStatus("준비됨"); };
             overlay.SetContent(new List<Item>(), "번역 중...");
             overlay.Show();
+            panel.SetStatus("번역 중...");
             RunJob(bmp, true, ++jobId);
         }
 
@@ -1234,8 +1754,10 @@ namespace ScreenTranslatorApp
             lastSig = null;
             OcrService.BestLang = null;
             overlay = new OverlayForm(rect, true);
-            overlay.SetContent(new List<Item>(), "실시간 번역 시작 (Ctrl+Alt+X 로 중지)");
+            overlay.SetContent(new List<Item>(), "실시간 번역 시작");
             overlay.Show();
+            panel.SetLive(true);
+            panel.SetStatus("실시간 번역 중... (중지: 버튼 또는 Ctrl+Alt+X)");
             liveTimer.Interval = st.LiveIntervalMs;
             liveTimer.Start();
             OnLiveTick(null, EventArgs.Empty);
@@ -1244,10 +1766,19 @@ namespace ScreenTranslatorApp
         void OnLiveTick(object sender, EventArgs e)
         {
             if (!liveOn || liveBusy || overlay == null) return;
+            int cd = Translator.CooldownSeconds();
+            if (cd > 0 && Translator.DeepLKey.Length == 0)
+            {
+                string m = "번역 서버 제한 중... " + cd + "초 뒤 자동으로 다시 시도해요";
+                overlay.SetStatus(m);
+                panel.SetStatus(m);
+                lastSig = null;
+                return;
+            }
             bool hidden = false;
             if (!overlay.ExcludedFromCapture) { overlay.Opacity = 0; hidden = true; Application.DoEvents(); Thread.Sleep(30); }
             Bitmap bmp;
-            try { bmp = CaptureScreen(liveRect); }
+            try { bmp = CaptureClean(liveRect); }
             finally { if (hidden && overlay != null) overlay.Opacity = 1; }
             byte[] sig = Signature(bmp);
             if (!Changed(lastSig, sig)) { bmp.Dispose(); return; }
@@ -1270,10 +1801,25 @@ namespace ScreenTranslatorApp
                 {
                     liveBusy = false;
                     if (id != jobId || overlay == null) return;
+                    if (err.Length > 0 && items.Count == 0 && liveOn)
+                    {
+                        // 실시간 중 실패: 이전 번역은 그대로 두고 상태만 알려요. 다음 주기에 다시 시도해요.
+                        overlay.SetStatus(err);
+                        panel.SetStatus(err);
+                        lastSig = null;
+                        return;
+                    }
                     string status = "";
                     if (err.Length > 0) status = err;
                     else if (items.Count == 0 && !liveOn) status = "번역할 외국어 텍스트를 찾지 못했어요 (클릭하면 닫혀요)";
                     overlay.SetContent(items, status);
+
+                    string ps;
+                    if (err.Length > 0) ps = err;
+                    else if (items.Count == 0) ps = "번역할 외국어를 찾지 못했어요";
+                    else if (liveOn) ps = "실시간 번역 중... (" + items.Count + "개)";
+                    else ps = "번역 완료 (" + items.Count + "개) - 번역 화면을 클릭하면 닫혀요";
+                    panel.SetStatus(ps);
                 });
             });
         }
@@ -1300,7 +1846,7 @@ namespace ScreenTranslatorApp
             if (updBusy) return;
             if (st.UpdateUrl.Length == 0)
             {
-                if (manual) Notify("업데이트", "업데이트 주소가 아직 없어요. 우클릭 > 업데이트 > 업데이트 주소 설정");
+                if (manual) Notify("업데이트", "업데이트 주소가 아직 없어요. 설정 > 업데이트 주소에서 입력해 주세요");
                 return;
             }
             updBusy = true;
@@ -1335,7 +1881,8 @@ namespace ScreenTranslatorApp
             try
             {
                 string exe = Application.ExecutablePath;
-                ProcessStartInfo psi = new ProcessStartInfo("cmd.exe", "/c ping 127.0.0.1 -n 3 >nul & start \"\" \"" + exe + "\" --updated");
+                string extra = Program.Autostart ? " --autostart" : "";
+                ProcessStartInfo psi = new ProcessStartInfo("cmd.exe", "/c ping 127.0.0.1 -n 3 >nul & start \"\" \"" + exe + "\" --updated" + extra);
                 psi.UseShellExecute = false;
                 psi.CreateNoWindow = true;
                 Process.Start(psi);
@@ -1362,7 +1909,7 @@ namespace ScreenTranslatorApp
                           "예: https://github.com/내아이디/screen-translator\r\n\r\n" +
                           "• 이 주소의 프로그램 코드를 내려받아 이 PC에서 컴파일·실행하게 돼요.\r\n" +
                           "• 반드시 본인이 직접 관리하는 저장소 주소만 입력하세요.\r\n" +
-                          "• 끄려면 업데이트 메뉴에서 자동 업데이트 체크를 해제하세요.";
+                          "• 끄려면 설정에서 자동 업데이트 체크를 해제하세요.";
                 TextBox tb = new TextBox();
                 tb.Left = 14; tb.Top = 172; tb.Width = 472;
                 tb.Text = st.UpdateUrl;
@@ -1391,6 +1938,7 @@ namespace ScreenTranslatorApp
         {
             StopAll();
             if (notify != null) { notify.Visible = false; notify.Dispose(); }
+            if (panel != null) { try { panel.Dispose(); } catch { } }
             base.OnFormClosing(e);
         }
     }
@@ -1398,12 +1946,17 @@ namespace ScreenTranslatorApp
     static class Program
     {
         public static bool JustUpdated;
+        public static bool Autostart;
 
         [STAThread]
         static void Main(string[] args)
         {
             try { Native.SetProcessDPIAware(); } catch { }
-            foreach (string a in args) if (a == "--updated") JustUpdated = true;
+            foreach (string a in args)
+            {
+                if (a == "--updated") JustUpdated = true;
+                if (a == "--autostart") Autostart = true;
+            }
             bool created;
             Mutex mutex = new Mutex(true, "Local\\ScreenTranslatorOverlay", out created);
             if (!created && JustUpdated)
@@ -1417,7 +1970,7 @@ namespace ScreenTranslatorApp
             }
             if (!created)
             {
-                MessageBox.Show("이미 실행 중이에요.\n화면 오른쪽 아래 트레이(^) 아이콘을 확인해 보세요.", "화면 번역기");
+                MessageBox.Show("이미 실행 중이에요.\n화면 오른쪽 아래 트레이(^) 아이콘을 눌러 보세요.", "화면 번역기");
                 return;
             }
             try { ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; } catch { }
