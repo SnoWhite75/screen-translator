@@ -811,8 +811,13 @@ namespace ScreenTranslatorApp
                 string p = Path.Combine(dir, n);
                 if (File.Exists(p)) sb.Append("/r:\"" + p + "\" ");
             }
-            string winmd = Path.Combine(win, @"System32\WinMetadata\Windows.winmd");
-            if (File.Exists(winmd)) sb.Append("/r:\"" + winmd + "\" ");
+            // 최신 Windows 는 Windows.winmd 하나가 아니라 기능별 .winmd 여러 개로 나뉘어 있어요
+            string wmDir = Path.Combine(win, @"System32\WinMetadata");
+            if (Directory.Exists(wmDir))
+            {
+                foreach (string f in Directory.GetFiles(wmDir, "*.winmd"))
+                    sb.Append("/r:\"" + f + "\" ");
+            }
             return sb.ToString();
         }
 
