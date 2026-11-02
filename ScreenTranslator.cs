@@ -40,6 +40,7 @@ namespace ScreenTranslatorApp
         public const uint MOD_ALT = 1;
         public const uint MOD_CONTROL = 2;
         public const uint MOD_NOREPEAT = 0x4000;
+        public const uint WDA_NONE = 0;
         public const uint WDA_EXCLUDEFROMCAPTURE = 0x11;
     }
 
@@ -1519,7 +1520,6 @@ namespace ScreenTranslatorApp
     {
         List<Item> items = new List<Item>();
         string status = "";
-        public bool ExcludedFromCapture;
         static readonly Color KeyColor = Color.FromArgb(1, 2, 3);
 
         public OverlayForm(Rectangle bounds)
@@ -1551,8 +1551,6 @@ namespace ScreenTranslatorApp
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
-            try { ExcludedFromCapture = Native.SetWindowDisplayAffinity(Handle, Native.WDA_EXCLUDEFROMCAPTURE); }
-            catch { ExcludedFromCapture = false; }
         }
 
         public void SetStatus(string st)
@@ -1926,8 +1924,8 @@ namespace ScreenTranslatorApp
                 f.ClientSize = new Size(440, 470);
 
                 Label info = new Label();
-                info.Text = "글자를 읽으려면(OCR) 그 언어의 언어팩이 Windows 에 설치돼 있어야 해요.\n읽고 싶은 언어를 체크하고 설치를 누르세요. 설치 전에 한 번 더 확인해요.";
-                info.SetBounds(14, 12, 412, 40);
+                info.Text = "글자를 읽으려면(OCR) 그 언어팩이 Windows 에 있어야 해요.\n읽을 언어를 체크하고 설치를 누르세요. 설치 전에 한 번 더 물어봐요.";
+                info.SetBounds(14, 10, 412, 46);
                 f.Controls.Add(info);
 
                 CheckedListBox clb = new CheckedListBox();
@@ -1989,7 +1987,7 @@ namespace ScreenTranslatorApp
     // ------------------------------------------------------------------ app info / self update
     static class AppInfo
     {
-        public const int AppVersion = 6;
+        public const int AppVersion = 7;
 
         public static string DataDir()
         {
@@ -2177,7 +2175,6 @@ namespace ScreenTranslatorApp
     class MainPanel : Form
     {
         public Action RegionClicked, LiveClicked, FullClicked, ClearClicked, SettingsClicked, LangClicked, HiddenToTray;
-        public bool ExcludedFromCapture;
         Button bLive;
         Label lbStatus;
 
@@ -2281,8 +2278,6 @@ namespace ScreenTranslatorApp
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
-            try { ExcludedFromCapture = Native.SetWindowDisplayAffinity(Handle, Native.WDA_EXCLUDEFROMCAPTURE); }
-            catch { ExcludedFromCapture = false; }
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
@@ -2740,12 +2735,36 @@ namespace ScreenTranslatorApp
         }
 
         // 번역기 창 자체가 캡처에 찍히지 않게 해요
+        // 번역 화면·버튼 창은 평소 녹화·스크린샷에 그대로 찍혀요.
+        // 번역기가 화면을 읽는 그 순간(약 0.06초)에만 캡처에서 빼서, 자기 번역문을 다시 읽지 않게 해요.
+        // (화면에서는 깜빡이지 않아요. 아주 오래된 Windows 에서만 잠깐 숨겼다가 다시 보여줘요.)
         Bitmap CaptureClean(Rectangle r)
         {
-            bool tmp = panel != null && panel.Visible && !panel.ExcludedFromCapture;
-            if (tmp) { panel.Opacity = 0; Application.DoEvents(); Thread.Sleep(80); }
+            List<Form> toggled = new List<Form>();
+            List<Form> hidden = new List<Form>();
+            Form[] wins = new Form[] { overlay, panel };
+            foreach (Form f in wins)
+            {
+                if (f == null || f.IsDisposed || !f.Visible) continue;
+                bool ok = false;
+                try { ok = Native.SetWindowDisplayAffinity(f.Handle, Native.WDA_EXCLUDEFROMCAPTURE); } catch { ok = false; }
+                if (ok) toggled.Add(f);
+                else { f.Opacity = 0; hidden.Add(f); }
+            }
+            if (hidden.Count > 0) Application.DoEvents();
+            if (toggled.Count + hidden.Count > 0) Thread.Sleep(60);
             try { return CaptureScreen(r); }
-            finally { if (tmp) panel.Opacity = 1; }
+            finally
+            {
+                foreach (Form f in toggled)
+                {
+                    try { if (!f.IsDisposed) Native.SetWindowDisplayAffinity(f.Handle, Native.WDA_NONE); } catch { }
+                }
+                foreach (Form f in hidden)
+                {
+                    try { if (!f.IsDisposed) f.Opacity = 1; } catch { }
+                }
+            }
         }
 
         static byte[] Signature(Bitmap b)
@@ -2785,11 +2804,7 @@ namespace ScreenTranslatorApp
         void OnWatchTick(object sender, EventArgs e)
         {
             if (overlay == null || liveOn || baseSig == null) { watchTimer.Stop(); return; }
-            bool hidden = false;
-            if (!overlay.ExcludedFromCapture) { overlay.Opacity = 0; hidden = true; Application.DoEvents(); Thread.Sleep(30); }
-            Bitmap bmp;
-            try { bmp = CaptureClean(watchRect); }
-            finally { if (hidden && overlay != null) overlay.Opacity = 1; }
+            Bitmap bmp = CaptureClean(watchRect);
             byte[] sig = Signature(bmp);
             bmp.Dispose();
             if (Changed(baseSig, sig, 1800))
@@ -2895,11 +2910,7 @@ namespace ScreenTranslatorApp
                 lastSig = null;
                 return;
             }
-            bool hidden = false;
-            if (!overlay.ExcludedFromCapture) { overlay.Opacity = 0; hidden = true; Application.DoEvents(); Thread.Sleep(30); }
-            Bitmap bmp;
-            try { bmp = CaptureClean(liveRect); }
-            finally { if (hidden && overlay != null) overlay.Opacity = 1; }
+            Bitmap bmp = CaptureClean(liveRect);
             byte[] sig = Signature(bmp);
             if (!Changed(lastSig, sig)) { bmp.Dispose(); return; }
             bool first = lastSig == null;
