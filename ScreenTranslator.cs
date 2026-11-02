@@ -1134,6 +1134,43 @@ namespace ScreenTranslatorApp
             return (hi + 0.05) / (lo + 0.05);
         }
 
+        bool InkColumn(int x, int top, int bot, Color fg)
+        {
+            int cnt = 0;
+            for (int y = top; y <= bot; y += 2)
+            {
+                Color c = At(x, y);
+                int d = Math.Abs(c.R - fg.R) + Math.Abs(c.G - fg.G) + Math.Abs(c.B - fg.B);
+                if (d < 110 && ++cnt >= 2) return true;
+            }
+            return false;
+        }
+
+        // OCR 상자가 글자보다 좁거나 한쪽으로 어긋났을 때, 글자색과 비슷한 픽셀이 이어지는 만큼 좌우로 넓혀요 (최대 1.6줄 높이)
+        public RectangleF ExtendX(RectangleF r, Color fg, float h)
+        {
+            int top = (int)(r.Top + r.Height * 0.15f), bot = (int)(r.Bottom - r.Height * 0.15f);
+            if (bot <= top) return r;
+            float reach = 1.6f * h, maxGap = 0.45f * h;
+            float lastInk = r.Left;
+            int gap = 0;
+            for (int x = (int)r.Left - 1; x >= 0 && r.Left - x <= reach; x--)
+            {
+                if (InkColumn(x, top, bot, fg)) { lastInk = x; gap = 0; }
+                else { gap++; if (gap > maxGap) break; }
+            }
+            float left = Math.Min(r.Left, lastInk);
+            lastInk = r.Right;
+            gap = 0;
+            for (int x = (int)Math.Ceiling(r.Right); x < W && x - r.Right <= reach; x++)
+            {
+                if (InkColumn(x, top, bot, fg)) { lastInk = x + 1; gap = 0; }
+                else { gap++; if (gap > maxGap) break; }
+            }
+            float right = Math.Max(r.Right, lastInk);
+            return RectangleF.FromLTRB(left, r.Top, right, r.Bottom);
+        }
+
         // 상자 안에서 배경과 가장 다른 색 = 원문 글자색. 대비가 부족하면 검정/흰색.
         public Color Foreground(RectangleF r, Color bg)
         {
@@ -1269,13 +1306,9 @@ namespace ScreenTranslatorApp
             // 작은 영역은 2배만, 이미 한 번 정해졌으면 그 배율만 읽어요.
             List<float> factors = new List<float>();
             float cap = (float)maxDim / big;
-            if (!detect && BestLang != null && BestFactor > 0f) factors.Add(Math.Min(BestFactor, cap));
-            else
-            {
-                if (big >= 1000) factors.Add(1f);
-                if (cap >= 1.2f) factors.Add(Math.Min(2f, cap));
-                if (factors.Count == 0) factors.Add(1f);
-            }
+            if (big >= 1000) factors.Add(1f);
+            if (cap >= 1.2f) factors.Add(Math.Min(2f, cap));
+            if (factors.Count == 0) factors.Add(1f);
 
             List<string> tryTags = new List<string>();
             if (!detect && BestLang != null && langs.Contains(BestLang)) tryTags.Add(BestLang);
@@ -1339,35 +1372,60 @@ namespace ScreenTranslatorApp
                 for (int i = 0; i < n; i++) th[i].Join();
             }
 
-            // 가장 잘 읽힌 점수의 70% 이상이면, 글자가 덜 조각나는 작은 배율을 우선해요
+            // 점수는 쓰레기로 걸러질 줄을 뺀 '그럴듯한 줄'로만 매겨요 (세로로 길게 잘못 읽은 줄 등이 점수를 따 가지 못하게)
             int[] scores = new int[n];
-            int top = 0;
+            int[] good = new int[n];
             for (int i = 0; i < n; i++)
             {
                 if (errs[i] != null) Error = errs[i];
                 if (results[i] == null) continue;
-                foreach (LineInfo li in results[i]) scores[i] += Score(li.Text);
-                if (scores[i] > top) top = scores[i];
+                foreach (LineInfo li in results[i])
+                {
+                    if (Pipeline.Reject(li) != null) continue;
+                    scores[i] += Score(li.Text);
+                    good[i]++;
+                }
             }
-            int pick = -1;
-            for (int i = 0; i < n; i++)
+            // 언어 고르기: 배율 중 가장 잘 읽은 점수가 가장 높은 언어
+            int pickTag = -1, pickScore = 0;
+            for (int t = 0; t < nt; t++)
             {
-                if (results[i] == null || scores[i] <= 0 || scores[i] * 10 < top * 7) continue;
-                if (pick < 0) { pick = i; continue; }
-                float fa = factors[i % nf], fb = factors[pick % nf];
-                if (fa < fb - 0.01f || (Math.Abs(fa - fb) < 0.01f && scores[i] > scores[pick])) pick = i;
+                int ts = 0;
+                for (int f = 0; f < nf; f++) if (scores[t * nf + f] > ts) ts = scores[t * nf + f];
+                if (ts > pickScore) { pickScore = ts; pickTag = t; }
             }
+
             StringBuilder inf = new StringBuilder();
             inf.AppendLine("OCR 설치 언어: " + string.Join(", ", langs.ToArray()));
             for (int i = 0; i < n; i++)
                 inf.AppendLine("  " + tryTags[i / nf] + " @" + factors[i % nf].ToString("0.0") + "배: " +
-                               (results[i] == null ? "실패" : results[i].Count + "줄") + "  점수 " + scores[i] + "  " + ms[i] + "ms" +
-                               (errs[i] != null ? "  " + errs[i] : "") + (i == pick ? "  <== 선택" : ""));
+                               (results[i] == null ? "실패" : results[i].Count + "줄(통과 " + good[i] + ")") + "  점수 " + scores[i] + "  " + ms[i] + "ms" +
+                               (errs[i] != null ? "  " + errs[i] : "") + (i / nf == pickTag ? "  <== 선택" : ""));
             LastInfo = inf.ToString();
-            if (pick < 0) return new List<LineInfo>();
-            BestLang = tryTags[pick / nf];
-            BestFactor = factors[pick % nf];
-            return results[pick];
+            if (pickTag < 0) return new List<LineInfo>();
+            BestLang = tryTags[pickTag];
+
+            // 두 배율에서 읽은 그럴듯한 줄을 합쳐요 (작은 배율 우선, 겹치는 줄은 한 번만)
+            List<LineInfo> merged = new List<LineInfo>();
+            for (int f = 0; f < nf; f++)
+            {
+                List<LineInfo> l = results[pickTag * nf + f];
+                if (l == null) continue;
+                foreach (LineInfo li in l)
+                {
+                    if (Pipeline.Reject(li) != null) continue;
+                    bool dup = false;
+                    foreach (LineInfo m in merged)
+                    {
+                        RectangleF x = RectangleF.Intersect(m.Rect, li.Rect);
+                        float ia = x.Width * x.Height;
+                        float minA = Math.Min(m.Rect.Width * m.Rect.Height, li.Rect.Width * li.Rect.Height);
+                        if (minA > 0f && ia / minA > 0.35f) { dup = true; break; }
+                    }
+                    if (!dup) merged.Add(li);
+                }
+            }
+            return merged;
         }
 
         // 언어 고르기 점수. 한글은 0점이에요: 한국어는 번역 대상이 아니고, 한국어 OCR 이 일본어·중국어 화면을
@@ -1395,7 +1453,8 @@ namespace ScreenTranslatorApp
             {
                 WMO.OcrEngine eng = Engine(tag);
                 if (eng == null) { errs[idx] = "엔진 생성 실패"; return; }
-                results[idx] = Run(raw, bw, bh, eng, factor);
+                // 같은 엔진 객체는 동시에 두 번 돌릴 수 없어요 (배율 1배/2배가 같은 엔진을 쓰므로 차례로)
+                lock (eng) { results[idx] = Run(raw, bw, bh, eng, factor); }
             }
             catch (Exception ex) { errs[idx] = "OCR 오류: " + ex.Message; }
             finally { ms[idx] = sw.ElapsedMilliseconds; }
@@ -1545,6 +1604,29 @@ namespace ScreenTranslatorApp
             return null;
         }
 
+        // 줄이 쓰레기(그림·장식을 잘못 읽은 것)인지 판단해서 이유를 돌려줘요. 괜찮으면 null.
+        public static string Reject(LineInfo li)
+        {
+            string why = JunkReason(li.Text);
+            if (why != null) return why;
+            if (li.Rect.Height > 1.4f * li.Rect.Width) return "세로로 긴 줄"; // 가로 번역문을 넣을 수 없고, 그림을 잘못 읽은 경우가 대부분이에요
+            // 글자는 대체로 정사각형에 가까워요. 글자 수에 비해 높이가 너무 큰 상자는 잘못 읽은 거예요.
+            int n = 0, wide = 0;
+            foreach (char c in li.Text)
+            {
+                if (char.IsWhiteSpace(c)) continue;
+                n++;
+                if (c >= 0x3000) wide++;
+            }
+            if (n >= 2)
+            {
+                float avgW = li.Rect.Width / n;
+                float limit = wide * 2 >= n ? 2.2f : 5f;
+                if (li.Rect.Height > limit * avgW) return "글자 모양 이상";
+            }
+            return null;
+        }
+
         public static DebugInfo LastDebug;
 
         static void SaveDebugFiles(Bitmap bmp, DebugInfo d)
@@ -1591,8 +1673,7 @@ namespace ScreenTranslatorApp
             StringBuilder rejected = new StringBuilder();
             foreach (LineInfo li in joined)
             {
-                string why = JunkReason(li.Text);
-                if (why == null && li.Rect.Height > 1.4f * li.Rect.Width) why = "세로로 긴 줄"; // 가로 번역문을 넣을 수 없고, 그림을 잘못 읽은 경우가 대부분이에요
+                string why = Reject(li);
                 if (why != null)
                 {
                     if (boxes != null) boxes.Add(new DbgBox(li.Rect, li.Text, 1, why));
@@ -1630,6 +1711,7 @@ namespace ScreenTranslatorApp
                 it.LineH = (float)(todo[i].SumH / todo[i].Lines);
                 it.Bg = pix.Background(r);
                 it.Fg = pix.Foreground(r, it.Bg);
+                it.Rect = RectangleF.Intersect(pix.ExtendX(r, it.Fg, it.LineH), bounds);
                 items.Add(it);
             }
 
@@ -2263,7 +2345,7 @@ namespace ScreenTranslatorApp
     // ------------------------------------------------------------------ app info / self update
     static class AppInfo
     {
-        public const int AppVersion = 12;
+        public const int AppVersion = 13;
 
         public static string DataDir()
         {
