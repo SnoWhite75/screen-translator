@@ -1129,6 +1129,7 @@ namespace ScreenTranslatorApp
     {
         static Dictionary<string, WMO.OcrEngine> engines = new Dictionary<string, WMO.OcrEngine>();
         public static string BestLang = null;
+        public static float BestFactor = 0f;
         public static string Error = "";
 
         public static List<string> Languages()
@@ -1217,6 +1218,7 @@ namespace ScreenTranslatorApp
         {
             lock (engines) { engines.Clear(); }
             BestLang = null;
+            BestFactor = 0f;
         }
 
         // detect: try every installed OCR language (in parallel) and keep the one that reads the most text
@@ -1232,75 +1234,102 @@ namespace ScreenTranslatorApp
             int maxDim = 2000;
             try { maxDim = (int)WMO.OcrEngine.MaxImageDimension; } catch { }
             int big = Math.Max(src.Width, src.Height);
-            // 작은 영역(자막 등)만 2배로 키워 읽고, 큰 화면은 원래 크기로 읽어요. Windows OCR 은 큰 글씨를 더 키우면 오히려 조각내요.
-            float factor = Math.Min(big >= 1000 ? 1f : 2f, (float)maxDim / big);
-            Bitmap prep = src;
-            bool own = false;
-            if (Math.Abs(factor - 1f) > 0.01f)
+
+            // 어떤 배율이 잘 읽힐지는 화면마다 달라서 원래 크기(1배)와 2배를 둘 다 읽어 보고, 더 잘 읽힌 쪽을 써요.
+            // 작은 영역은 2배만, 이미 한 번 정해졌으면 그 배율만 읽어요.
+            List<float> factors = new List<float>();
+            float cap = (float)maxDim / big;
+            if (!detect && BestLang != null && BestFactor > 0f) factors.Add(Math.Min(BestFactor, cap));
+            else
             {
-                prep = new Bitmap((int)(src.Width * factor), (int)(src.Height * factor));
-                using (Graphics g = Graphics.FromImage(prep))
-                {
-                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                    g.DrawImage(src, 0, 0, prep.Width, prep.Height);
-                }
-                own = true;
+                if (big >= 1000) factors.Add(1f);
+                if (cap >= 1.2f) factors.Add(Math.Min(2f, cap));
+                if (factors.Count == 0) factors.Add(1f);
             }
-            try
+
+            List<string> tryTags = new List<string>();
+            if (!detect && BestLang != null && langs.Contains(BestLang)) tryTags.Add(BestLang);
+            else { foreach (string t in langs) { if (tryTags.Count < 6) tryTags.Add(t); } }
+
+            // 배율마다 픽셀을 한 번만 읽어서 모든 언어가 같이 써요
+            int nf = factors.Count;
+            byte[][] raws = new byte[nf][];
+            int[] bws = new int[nf];
+            int[] bhs = new int[nf];
+            for (int f = 0; f < nf; f++)
             {
-                // 픽셀은 한 번만 읽어서 모든 언어가 같이 써요
-                byte[] raw;
-                int bw, bh;
-                System.Drawing.Imaging.BitmapData bd = prep.LockBits(new Rectangle(0, 0, prep.Width, prep.Height),
-                    System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-                raw = new byte[bd.Stride * bd.Height];
-                bw = bd.Width;
-                bh = bd.Height;
-                try { Marshal.Copy(bd.Scan0, raw, 0, raw.Length); }
-                finally { prep.UnlockBits(bd); }
-
-                List<string> tryTags = new List<string>();
-                if (!detect && BestLang != null && langs.Contains(BestLang)) tryTags.Add(BestLang);
-                else { foreach (string t in langs) { if (tryTags.Count < 6) tryTags.Add(t); } }
-
-                int n = tryTags.Count;
-                List<LineInfo>[] results = new List<LineInfo>[n];
-                string[] errs = new string[n];
-                if (n == 1)
+                Bitmap prep = src;
+                bool own = false;
+                if (Math.Abs(factors[f] - 1f) > 0.01f)
                 {
-                    RunTag(tryTags[0], raw, bw, bh, factor, results, errs, 0);
-                }
-                else
-                {
-                    Thread[] th = new Thread[n];
-                    for (int i = 0; i < n; i++)
+                    prep = new Bitmap((int)(src.Width * factors[f]), (int)(src.Height * factors[f]));
+                    using (Graphics g = Graphics.FromImage(prep))
                     {
-                        int idx = i;
-                        th[i] = new Thread(delegate () { RunTag(tryTags[idx], raw, bw, bh, factor, results, errs, idx); });
-                        th[i].IsBackground = true;
-                        th[i].Start();
+                        g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                        g.DrawImage(src, 0, 0, prep.Width, prep.Height);
                     }
-                    for (int i = 0; i < n; i++) th[i].Join();
+                    own = true;
                 }
+                try
+                {
+                    System.Drawing.Imaging.BitmapData bd = prep.LockBits(new Rectangle(0, 0, prep.Width, prep.Height),
+                        System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                    raws[f] = new byte[bd.Stride * bd.Height];
+                    bws[f] = bd.Width;
+                    bhs[f] = bd.Height;
+                    try { Marshal.Copy(bd.Scan0, raws[f], 0, raws[f].Length); }
+                    finally { prep.UnlockBits(bd); }
+                }
+                finally
+                {
+                    if (own) prep.Dispose();
+                }
+            }
 
-                List<LineInfo> best = new List<LineInfo>();
-                int bestScore = -1;
-                string bestTag = null;
+            int nt = tryTags.Count;
+            int n = nt * nf;
+            List<LineInfo>[] results = new List<LineInfo>[n];
+            string[] errs = new string[n];
+            if (n == 1)
+            {
+                RunTag(tryTags[0], raws[0], bws[0], bhs[0], factors[0], results, errs, 0);
+            }
+            else
+            {
+                Thread[] th = new Thread[n];
                 for (int i = 0; i < n; i++)
                 {
-                    if (errs[i] != null) Error = errs[i];
-                    if (results[i] == null) continue;
-                    int score = 0;
-                    foreach (LineInfo li in results[i]) score += Score(li.Text);
-                    if (score > bestScore) { bestScore = score; best = results[i]; bestTag = tryTags[i]; }
+                    int idx = i;
+                    int ti = i / nf, fi = i % nf;
+                    th[i] = new Thread(delegate () { RunTag(tryTags[ti], raws[fi], bws[fi], bhs[fi], factors[fi], results, errs, idx); });
+                    th[i].IsBackground = true;
+                    th[i].Start();
                 }
-                if (bestTag != null && bestScore > 0) BestLang = bestTag;
-                return best;
+                for (int i = 0; i < n; i++) th[i].Join();
             }
-            finally
+
+            // 가장 잘 읽힌 점수의 70% 이상이면, 글자가 덜 조각나는 작은 배율을 우선해요
+            int[] scores = new int[n];
+            int top = 0;
+            for (int i = 0; i < n; i++)
             {
-                if (own) prep.Dispose();
+                if (errs[i] != null) Error = errs[i];
+                if (results[i] == null) continue;
+                foreach (LineInfo li in results[i]) scores[i] += Score(li.Text);
+                if (scores[i] > top) top = scores[i];
             }
+            int pick = -1;
+            for (int i = 0; i < n; i++)
+            {
+                if (results[i] == null || scores[i] <= 0 || scores[i] * 10 < top * 7) continue;
+                if (pick < 0) { pick = i; continue; }
+                float fa = factors[i % nf], fb = factors[pick % nf];
+                if (fa < fb - 0.01f || (Math.Abs(fa - fb) < 0.01f && scores[i] > scores[pick])) pick = i;
+            }
+            if (pick < 0) return new List<LineInfo>();
+            BestLang = tryTags[pick / nf];
+            BestFactor = factors[pick % nf];
+            return results[pick];
         }
 
         // 언어 고르기 점수. 한글은 0점이에요: 한국어는 번역 대상이 아니고, 한국어 OCR 이 일본어·중국어 화면을
@@ -2081,7 +2110,7 @@ namespace ScreenTranslatorApp
     // ------------------------------------------------------------------ app info / self update
     static class AppInfo
     {
-        public const int AppVersion = 10;
+        public const int AppVersion = 11;
 
         public static string DataDir()
         {
