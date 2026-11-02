@@ -21,7 +21,7 @@ if "!WREFS!"=="" (
 set "ICOARG="
 if exist "ScreenTranslator.ico" set "ICOARG=/win32icon:ScreenTranslator.ico"
 
-"%FW%\csc.exe" /nologo /target:winexe /optimize+ /codepage:65001 %ICOARG% /out:ScreenTranslator.exe /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:"%FW%\System.Runtime.WindowsRuntime.dll" /r:"%FW%\System.Runtime.dll" !WREFS! ScreenTranslator.cs
+"%FW%\csc.exe" /nologo /target:winexe /optimize+ /codepage:65001 %ICOARG% /out:ScreenTranslator.exe /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:"%FW%\System.Runtime.dll" !WREFS! ScreenTranslator.cs
 
 if errorlevel 1 (
   echo.

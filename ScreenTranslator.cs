@@ -350,18 +350,32 @@ namespace ScreenTranslatorApp
         static readonly Regex CjkSpace = new Regex(
             @"(?<=[\u3000-\u30ff\u3400-\u9fff\uff00-\uffef]) +(?=[\u3000-\u30ff\u3400-\u9fff\uff00-\uffef])", RegexOptions.Compiled);
 
+        // System.Runtime.WindowsRuntime.dll 의 AsTask() 대신 직접 완료를 기다려요 (참조 충돌 회피)
+        static T Await<T>(Windows.Foundation.IAsyncOperation<T> op)
+        {
+            ManualResetEvent done = new ManualResetEvent(false);
+            op.Completed = delegate (Windows.Foundation.IAsyncOperation<T> o, Windows.Foundation.AsyncStatus s) { done.Set(); };
+            if (!done.WaitOne(20000)) throw new TimeoutException("OCR 시간 초과");
+            return op.GetResults();
+        }
+
         static List<LineInfo> Run(Bitmap bmp, WMO.OcrEngine eng, float factor)
         {
             List<LineInfo> list = new List<LineInfo>();
-            using (MemoryStream ms = new MemoryStream())
+            using (WSS.DataWriter dw = new WSS.DataWriter())
             {
-                bmp.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
-                ms.Position = 0;
-                WSS.IRandomAccessStream ras = ms.AsRandomAccessStream();
-                WGI.BitmapDecoder dec = WGI.BitmapDecoder.GetDecoderAsync(ras).AsTask().Result;
-                using (WGI.SoftwareBitmap sb = dec.GetSoftwareBitmapAsync(WGI.BitmapPixelFormat.Bgra8, WGI.BitmapAlphaMode.Premultiplied).AsTask().Result)
+                // 비트맵 픽셀(BGRA)을 그대로 WinRT SoftwareBitmap 으로 넘겨요 (PNG 변환 없음)
+                System.Drawing.Imaging.BitmapData bd = bmp.LockBits(new Rectangle(0, 0, bmp.Width, bmp.Height),
+                    System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+                byte[] raw = new byte[bd.Stride * bd.Height];
+                int bw = bd.Width, bh = bd.Height;
+                try { Marshal.Copy(bd.Scan0, raw, 0, raw.Length); }
+                finally { bmp.UnlockBits(bd); }
+                dw.WriteBytes(raw);
+                WSS.IBuffer buf = dw.DetachBuffer();
+                using (WGI.SoftwareBitmap sb = WGI.SoftwareBitmap.CreateCopyFromBuffer(buf, WGI.BitmapPixelFormat.Bgra8, bw, bh))
                 {
-                    WMO.OcrResult res = eng.RecognizeAsync(sb).AsTask().Result;
+                    WMO.OcrResult res = Await<WMO.OcrResult>(eng.RecognizeAsync(sb));
                     foreach (WMO.OcrLine ln in res.Lines)
                     {
                         double x0 = double.MaxValue, y0 = double.MaxValue, x1 = 0, y1 = 0;
@@ -804,8 +818,7 @@ namespace ScreenTranslatorApp
             string win = Environment.GetEnvironmentVariable("WINDIR");
             if (string.IsNullOrEmpty(win)) win = @"C:\Windows";
             StringBuilder sb = new StringBuilder("/r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll ");
-            string[] names = { "System.Runtime.WindowsRuntime.dll", "System.Runtime.dll", "System.Threading.Tasks.dll",
-                               "System.Runtime.InteropServices.WindowsRuntime.dll" };
+            string[] names = { "System.Runtime.dll" };
             foreach (string n in names)
             {
                 string p = Path.Combine(dir, n);
