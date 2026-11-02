@@ -213,15 +213,20 @@ namespace ScreenTranslatorApp
     {
         public static Http Send(string url)
         {
-            return Request("GET", url, null, null);
+            return Request("GET", url, null, null, null);
         }
 
         public static Http Post(string url, string form, string authorization)
         {
-            return Request("POST", url, form, authorization);
+            return Request("POST", url, form, "application/x-www-form-urlencoded; charset=UTF-8", authorization);
         }
 
-        static Http Request(string method, string url, string body, string authorization)
+        public static Http PostJson(string url, string json, string authorization)
+        {
+            return Request("POST", url, json, "application/json; charset=UTF-8", authorization);
+        }
+
+        static Http Request(string method, string url, string body, string contentType, string authorization)
         {
             Http res = new Http();
             try
@@ -235,7 +240,7 @@ namespace ScreenTranslatorApp
                 if (body != null)
                 {
                     byte[] data = Encoding.UTF8.GetBytes(body);
-                    req.ContentType = "application/x-www-form-urlencoded; charset=UTF-8";
+                    req.ContentType = contentType;
                     req.ContentLength = data.Length;
                     using (Stream rs = req.GetRequestStream()) rs.Write(data, 0, data.Length);
                 }
@@ -269,9 +274,20 @@ namespace ScreenTranslatorApp
         static Dictionary<string, string> cache = new Dictionary<string, string>();
         static readonly object gate = new object();
         static DateTime nextAllowed = DateTime.MinValue;
+
+        // Google (무료, 비공식)
         static DateTime googleBlockedUntil = DateTime.MinValue;
         static int strikes = 0;
         static bool lastGoogleMismatch = false;
+        static string lastGoogleError = "";
+
+        // Microsoft (Edge 번역, 무료)
+        static string msToken = "";
+        static DateTime msTokenExpires = DateTime.MinValue;
+        static DateTime msBlockedUntil = DateTime.MinValue;
+        static string lastMsError = "";
+
+        // DeepL (선택, 무료 API 키)
         static string lastDeepLError = "";
 
         public static string LastError = "";
@@ -298,15 +314,21 @@ namespace ScreenTranslatorApp
             return HangulRatio(s) < 0.5;
         }
 
+        // 쓸 수 있는 엔진이 하나도 없을 때만 0보다 커요 (남은 초)
         public static int CooldownSeconds()
         {
-            double s = (googleBlockedUntil - DateTime.UtcNow).TotalSeconds;
+            if (DeepLKey.Length > 0) return 0;
+            double g = (googleBlockedUntil - DateTime.UtcNow).TotalSeconds;
+            double m = (msBlockedUntil - DateTime.UtcNow).TotalSeconds;
+            double s = Math.Min(g, m);
             return s > 0 ? (int)Math.Ceiling(s) : 0;
         }
 
         public static void ResetCooldown()
         {
             googleBlockedUntil = DateTime.MinValue;
+            msBlockedUntil = DateTime.MinValue;
+            msToken = "";
             strikes = 0;
         }
 
@@ -315,6 +337,17 @@ namespace ScreenTranslatorApp
             DateTime now = DateTime.UtcNow;
             if (nextAllowed > now) Thread.Sleep((int)(nextAllowed - now).TotalMilliseconds);
             nextAllowed = DateTime.UtcNow.AddMilliseconds(gapMs);
+        }
+
+        static void Log(string s)
+        {
+            try
+            {
+                string p = Path.Combine(AppInfo.DataDir(), "translate.log");
+                if (File.Exists(p) && new FileInfo(p).Length > 200000) File.Delete(p);
+                File.AppendAllText(p, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + s + "\r\n", Encoding.UTF8);
+            }
+            catch { }
         }
 
         // 번역이 필요 없거나 실패한 항목은 null. 실패 이유는 LastError 에 남아요.
@@ -369,24 +402,124 @@ namespace ScreenTranslatorApp
             return result;
         }
 
+        // 엔진 순서: DeepL(키가 있을 때) → Microsoft → Google. 하나라도 되면 끝.
         static string[] TranslateChunk(List<string> part)
         {
             string[] r;
+            List<string> errs = new List<string>();
             if (DeepLKey.Length > 0)
             {
                 r = ViaDeepL(part);
-                if (r != null) { Engine = "DeepL"; return r; }
+                if (r != null) { Engine = "DeepL"; LastError = ""; return r; }
+                errs.Add("DeepL: " + lastDeepLError);
             }
-            int cd = CooldownSeconds();
-            if (cd > 0)
+            r = ViaMicrosoft(part);
+            if (r != null) { Engine = "Microsoft"; LastError = ""; return r; }
+            errs.Add("Microsoft: " + lastMsError);
+
+            int gcd = (int)Math.Ceiling((googleBlockedUntil - DateTime.UtcNow).TotalSeconds);
+            if (gcd > 0)
             {
-                if (DeepLKey.Length == 0 || LastError.Length == 0)
-                    LastError = "번역 서버가 요청 제한으로 잠시 쉬는 중이에요 (" + cd + "초 뒤 자동 재시도)";
+                lastGoogleError = "요청 제한으로 쉬는 중 (" + gcd + "초)";
+            }
+            else
+            {
+                r = ViaGoogle(part);
+                if (r != null) { Engine = "Google"; LastError = ""; return r; }
+            }
+            errs.Add("Google: " + lastGoogleError);
+
+            LastError = "번역 서버에 연결하지 못했어요 - " + string.Join(" / ", errs.ToArray());
+            Log(LastError);
+            return null;
+        }
+
+        // ---------- Microsoft (Edge 번역) ----------
+        static string JsonStr(string s)
+        {
+            StringBuilder sb = new StringBuilder("\"");
+            foreach (char c in s)
+            {
+                switch (c)
+                {
+                    case '"': sb.Append("\\\""); break;
+                    case '\\': sb.Append("\\\\"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (c < 0x20) sb.Append("\\u").Append(((int)c).ToString("x4"));
+                        else sb.Append(c);
+                        break;
+                }
+            }
+            return sb.Append('"').ToString();
+        }
+
+        static string[] ViaMicrosoft(List<string> part)
+        {
+            if (DateTime.UtcNow < msBlockedUntil)
+            {
+                lastMsError = "잠시 쉬는 중 (" + (int)Math.Ceiling((msBlockedUntil - DateTime.UtcNow).TotalSeconds) + "초)";
                 return null;
             }
-            r = ViaGoogle(part);
-            if (r != null) Engine = "Google";
-            return r;
+            string err = "알 수 없는 오류";
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                if (msToken.Length == 0 || DateTime.UtcNow >= msTokenExpires)
+                {
+                    Http a = Fetcher.Send("https://edge.microsoft.com/translate/auth");
+                    if (a.Error != null) { err = "인증 서버에 연결하지 못했어요"; break; }
+                    if (a.Status != 200 || a.Body.Trim().Length < 20) { err = "인증 실패 (HTTP " + a.Status + ")"; break; }
+                    msToken = a.Body.Trim();
+                    msTokenExpires = DateTime.UtcNow.AddMinutes(8);
+                }
+                StringBuilder sb = new StringBuilder("[");
+                for (int i = 0; i < part.Count; i++)
+                {
+                    if (i > 0) sb.Append(',');
+                    sb.Append("{\"Text\":").Append(JsonStr(part[i])).Append('}');
+                }
+                sb.Append(']');
+                Throttle(250);
+                Http r = Fetcher.PostJson("https://api-edge.cognitive.microsofttranslator.com/translate?to=ko&api-version=3.0&includeSentenceLength=true",
+                                          sb.ToString(), "Bearer " + msToken);
+                if (r.Error != null) { err = "번역 서버에 연결하지 못했어요"; break; }
+                if (r.Status == 401) { msToken = ""; err = "인증이 만료됐어요 (HTTP 401)"; continue; }
+                if (r.Status == 429)
+                {
+                    msBlockedUntil = DateTime.UtcNow.AddSeconds(90);
+                    lastMsError = "요청 제한 (HTTP 429)";
+                    return null;
+                }
+                if (r.Status != 200) { err = "서버 오류 (HTTP " + r.Status + ")"; break; }
+                try
+                {
+                    List<object> root = MiniJson.Parse(r.Body) as List<object>;
+                    if (root == null || root.Count != part.Count) { err = "응답 개수가 맞지 않아요"; break; }
+                    string[] res = new string[part.Count];
+                    for (int i = 0; i < root.Count; i++)
+                    {
+                        Dictionary<string, object> d = root[i] as Dictionary<string, object>;
+                        List<object> tr = d["translations"] as List<object>;
+                        Dictionary<string, object> t0 = tr[0] as Dictionary<string, object>;
+                        string lang = "";
+                        if (d.ContainsKey("detectedLanguage"))
+                        {
+                            Dictionary<string, object> dl = d["detectedLanguage"] as Dictionary<string, object>;
+                            if (dl != null && dl.ContainsKey("language")) lang = (dl["language"] as string) ?? "";
+                        }
+                        res[i] = (lang == "ko") ? "" : ((t0["text"] as string) ?? "").Trim();
+                    }
+                    lastMsError = "";
+                    return res;
+                }
+                catch { err = "응답을 해석하지 못했어요"; break; }
+            }
+            msBlockedUntil = DateTime.UtcNow.AddSeconds(45);
+            lastMsError = err;
+            Log("Microsoft: " + err);
+            return null;
         }
 
         // ---------- Google (무료, 비공식) ----------
@@ -415,16 +548,17 @@ namespace ScreenTranslatorApp
             {
                 Throttle(600);
                 Http r = enc.Length <= 1500 ? Fetcher.Send(baseUrl + "&q=" + enc) : Fetcher.Post(baseUrl, "q=" + enc, null);
-                if (r.Error != null) { LastError = "인터넷에 연결할 수 없어요"; Thread.Sleep(300); continue; }
+                if (r.Error != null) { lastGoogleError = "인터넷에 연결할 수 없어요"; Thread.Sleep(300); continue; }
                 if (r.Status == 429 || r.Status == 503)
                 {
                     strikes++;
                     int wait = (int)(20 * Math.Pow(2, Math.Min(strikes, 5) - 1)); // 20초 → 40 → 80 → 160 → 320초
                     googleBlockedUntil = DateTime.UtcNow.AddSeconds(wait);
-                    LastError = "Google 무료 번역이 요청 제한을 걸었어요. " + wait + "초 쉬었다가 자동으로 다시 시도해요 (설정에서 DeepL 키를 넣으면 거의 안 생겨요)";
+                    lastGoogleError = "요청 제한 (HTTP " + r.Status + ", " + wait + "초 쉬어요)";
+                    Log("Google: " + lastGoogleError);
                     return null;
                 }
-                if (r.Status != 200) { LastError = "번역 서버 오류 (" + r.Status + ")"; Thread.Sleep(300); continue; }
+                if (r.Status != 200) { lastGoogleError = "서버 오류 (HTTP " + r.Status + ")"; Thread.Sleep(300); continue; }
                 try
                 {
                     List<object> root = MiniJson.Parse(r.Body) as List<object>;
@@ -437,14 +571,14 @@ namespace ScreenTranslatorApp
                     }
                     string all = sb.ToString().Replace("\r", "");
                     strikes = 0;
-                    LastError = "";
+                    lastGoogleError = "";
                     if (expect == 1) return new string[] { all.Replace("\n", " ").Trim() };
                     List<string> ls = new List<string>(all.Split('\n'));
                     while (ls.Count > expect && ls[ls.Count - 1].Trim().Length == 0) ls.RemoveAt(ls.Count - 1);
                     if (ls.Count != expect)
                     {
                         lastGoogleMismatch = true;
-                        LastError = "번역 결과의 줄 수가 맞지 않아요";
+                        lastGoogleError = "번역 결과의 줄 수가 맞지 않아요";
                         return null;
                     }
                     for (int i = 0; i < ls.Count; i++) ls[i] = ls[i].Trim();
@@ -452,7 +586,7 @@ namespace ScreenTranslatorApp
                 }
                 catch
                 {
-                    LastError = "번역 응답을 해석하지 못했어요";
+                    lastGoogleError = "응답을 해석하지 못했어요";
                     return null;
                 }
             }
@@ -472,7 +606,7 @@ namespace ScreenTranslatorApp
             else if (r.Status == 403) err = "DeepL 키가 올바르지 않아요";
             else if (r.Status == 456) err = "DeepL 이번 달 무료 한도를 모두 썼어요";
             else if (r.Status == 429) err = "DeepL 요청이 너무 많아요";
-            else if (r.Status != 200) err = "DeepL 서버 오류 (" + r.Status + ")";
+            else if (r.Status != 200) err = "DeepL 서버 오류 (HTTP " + r.Status + ")";
             if (err == null)
             {
                 try
@@ -485,11 +619,10 @@ namespace ScreenTranslatorApp
                         for (int i = 0; i < list.Count; i++)
                         {
                             Dictionary<string, object> d = list[i] as Dictionary<string, object>;
-                            string lang = d.ContainsKey("detected_source_language") ? (d["detected_source_language"] as string) : "";
+                            string lang = d.ContainsKey("detected_source_language") ? ((d["detected_source_language"] as string) ?? "") : "";
                             res[i] = (lang == "KO") ? "" : ((d["text"] as string) ?? "").Trim();
                         }
                         lastDeepLError = "";
-                        LastError = "";
                         return res;
                     }
                     err = "DeepL 응답의 개수가 맞지 않아요";
@@ -497,23 +630,42 @@ namespace ScreenTranslatorApp
                 catch { err = "DeepL 응답을 해석하지 못했어요"; }
             }
             lastDeepLError = err;
-            LastError = err;
+            Log("DeepL: " + err);
             return null;
         }
 
-        // 설정 화면의 "번역 테스트"용 (캐시를 거치지 않고 실제로 요청해요)
+        // 설정 화면의 "번역 테스트": 엔진마다 따로 실제로 요청해서 결과/이유를 보여줘요
         public static string Test(out bool ok)
         {
             ok = false;
             lock (gate)
             {
-                lastDeepLError = "";
-                string[] r = TranslateChunk(new List<string>(new string[] { "Hello, world! This is a translation test." }));
-                ok = r != null && r.Length > 0 && !string.IsNullOrEmpty(r[0]);
-                string msg = ok ? "[" + Engine + "] " + r[0] : LastError;
-                if (DeepLKey.Length > 0 && lastDeepLError.Length > 0)
-                    msg += "\n\nDeepL: " + lastDeepLError + (ok ? "  →  Google 로 대신 번역했어요" : "");
-                return msg;
+                List<string> sample = new List<string>(new string[] { "Hello, world! This is a translation test." });
+                StringBuilder sb = new StringBuilder();
+                string[] r;
+
+                if (DeepLKey.Length > 0)
+                {
+                    r = ViaDeepL(sample);
+                    if (r != null && r[0].Length > 0) { ok = true; sb.AppendLine("DeepL: 성공 → " + r[0]); }
+                    else sb.AppendLine("DeepL: 실패 - " + lastDeepLError);
+                }
+                else sb.AppendLine("DeepL: 키 없음 (사용 안 함)");
+
+                msBlockedUntil = DateTime.MinValue;
+                msToken = "";
+                r = ViaMicrosoft(sample);
+                if (r != null && r[0].Length > 0) { ok = true; sb.AppendLine("Microsoft: 성공 → " + r[0]); }
+                else sb.AppendLine("Microsoft: 실패 - " + lastMsError);
+
+                googleBlockedUntil = DateTime.MinValue;
+                r = ViaGoogle(sample);
+                if (r != null && r[0].Length > 0) { ok = true; sb.AppendLine("Google: 성공 → " + r[0]); }
+                else sb.AppendLine("Google: 실패 - " + lastGoogleError);
+
+                sb.AppendLine();
+                sb.AppendLine(ok ? "하나라도 성공하면 번역은 동작해요. (자동으로 되는 엔진을 써요)" : "모든 엔진이 실패했어요. 인터넷 연결이나 방화벽을 확인해 주세요.");
+                return sb.ToString();
             }
         }
     }
@@ -974,7 +1126,7 @@ namespace ScreenTranslatorApp
     // ------------------------------------------------------------------ app info / self update
     static class AppInfo
     {
-        public const int AppVersion = 2;
+        public const int AppVersion = 3;
 
         public static string DataDir()
         {
@@ -1329,7 +1481,7 @@ namespace ScreenTranslatorApp
             g2.SetBounds(14, 84, 432, 186);
             Controls.Add(g2);
             Label l2 = new Label();
-            l2.Text = "기본은 Google 무료 번역이에요. '요청 제한' 오류가 자주 나면 DeepL 무료 API 키를 넣어 주세요 (월 50만 자 무료). 키는 이 PC에만 저장돼요.";
+            l2.Text = "기본은 무료 번역(Microsoft → Google 순서로 자동 선택)이에요. 그래도 막히면 DeepL 무료 API 키를 넣어 주세요 (월 50만 자 무료, 키는 이 PC에만 저장). '번역 테스트'로 엔진별 상태를 볼 수 있어요.";
             l2.SetBounds(14, 22, 404, 52);
             g2.Controls.Add(l2);
             Label l2b = new Label();
