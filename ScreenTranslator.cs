@@ -51,6 +51,7 @@ namespace ScreenTranslatorApp
         public bool AutoUpdate = true;
         public int FailedVersion = 0;
         public string DeepLKey = "";
+        public bool AutoClear = true;
 
         static string FilePath()
         {
@@ -79,6 +80,7 @@ namespace ScreenTranslatorApp
                             case "autoupdate": s.AutoUpdate = v == "1"; break;
                             case "failedver": int.TryParse(v, out s.FailedVersion); break;
                             case "deeplkey": s.DeepLKey = v; break;
+                            case "autoclear": s.AutoClear = v != "0"; break;
                         }
                     }
                 }
@@ -100,6 +102,7 @@ namespace ScreenTranslatorApp
                 l.Add("autoupdate=" + (AutoUpdate ? "1" : "0"));
                 l.Add("failedver=" + FailedVersion);
                 l.Add("deeplkey=" + DeepLKey);
+                l.Add("autoclear=" + (AutoClear ? "1" : "0"));
                 File.WriteAllLines(p, l.ToArray(), Encoding.UTF8);
             }
             catch { }
@@ -277,7 +280,6 @@ namespace ScreenTranslatorApp
     // 그래도 제한(429)이 걸리면 잠시 쉬었다가 자동으로 다시 시도해요.
     static class Translator
     {
-        static Dictionary<string, string> cache = new Dictionary<string, string>();
         static readonly object gate = new object();
         static DateTime nextAllowed = DateTime.MinValue;
 
@@ -300,6 +302,21 @@ namespace ScreenTranslatorApp
         // DeepL (선택, 무료 API 키)
         static string lastDeepLError = "";
 
+        // 번역 메모리: 번역한 문장을 디스크에 저장해서 다음 실행에도 다시 쓰고, OCR이 살짝 흔들린 같은 문장도 재사용해요
+        const int MaxMemory = 30000;
+        static Dictionary<string, string> memory = new Dictionary<string, string>();    // 정리한 원문 -> 번역 ("" = 번역 불필요)
+        static Dictionary<string, string> squeezed = new Dictionary<string, string>();  // 원문 -> 비교용 축약형
+        static Dictionary<string, string> bySqueezed = new Dictionary<string, string>(); // 축약형 -> 원문
+        static Dictionary<string, List<string>> idxHead = new Dictionary<string, List<string>>();
+        static Dictionary<string, List<string>> idxTail = new Dictionary<string, List<string>>();
+        static Queue<string> memOrder = new Queue<string>();
+        static bool memDirty = false;
+        static DateTime lastSave = DateTime.UtcNow;
+        static readonly Regex WsRx = new Regex(@"\s+", RegexOptions.Compiled);
+        static readonly Regex UrlRx = new Regex(@"^(https?://|www\.)\S+$|^[\w.+\-]+@[\w\-]+\.[\w.\-]+$|^[A-Za-z]:\\\S+$", RegexOptions.Compiled);
+        public static long SavedChars = 0;
+        public static int MemoryHits = 0;
+
         public static string LastError = "";
         public static string DeepLKey = "";
         public static string Engine = "";
@@ -318,9 +335,17 @@ namespace ScreenTranslatorApp
 
         public static bool WorthTranslating(string s)
         {
-            bool letter = false;
-            foreach (char c in s) if (char.IsLetter(c)) { letter = true; break; }
-            if (!letter) return false;
+            int letters = 0;
+            bool wide = false;
+            foreach (char c in s)
+            {
+                if (!char.IsLetter(c)) continue;
+                letters++;
+                if (c >= 0x3000) wide = true;
+            }
+            if (letters == 0) return false;
+            if (letters < 2 && !wide) return false;      // "A", "x" 같은 한 글자
+            if (UrlRx.IsMatch(s.Trim())) return false;  // 주소·이메일·경로는 번역하지 않아요
             return HangulRatio(s) < 0.5;
         }
 
@@ -362,51 +387,292 @@ namespace ScreenTranslatorApp
             catch { }
         }
 
+        // ---------- 번역 메모리 ----------
+        static string Norm(string s)
+        {
+            return WsRx.Replace(s, " ").Trim();
+        }
+
+        // 대소문자·공백·기호 차이와 OCR 단골 오인식(I/l/1, O/0)을 무시한 비교용 문자열
+        static string Squeeze(string s)
+        {
+            StringBuilder sb = new StringBuilder(s.Length);
+            foreach (char c0 in s)
+            {
+                char c = (c0 == 'I') ? 'l' : char.ToLowerInvariant(c0);
+                if (!char.IsLetterOrDigit(c)) continue;
+                if (c == '1' || c == 'i') c = 'l';
+                else if (c == '0') c = 'o';
+                sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        static string DigitsOf(string s)
+        {
+            StringBuilder sb = new StringBuilder();
+            foreach (char c in s) if (c >= '0' && c <= '9') sb.Append(c);
+            return sb.ToString();
+        }
+
+        static int Lev(string a, string b, int max)
+        {
+            if (Math.Abs(a.Length - b.Length) > max) return max + 1;
+            int[] prev = new int[b.Length + 1];
+            int[] cur = new int[b.Length + 1];
+            for (int j = 0; j <= b.Length; j++) prev[j] = j;
+            for (int i = 1; i <= a.Length; i++)
+            {
+                cur[0] = i;
+                int rowMin = cur[0];
+                for (int j = 1; j <= b.Length; j++)
+                {
+                    int cost = a[i - 1] == b[j - 1] ? 0 : 1;
+                    int v = Math.Min(Math.Min(prev[j] + 1, cur[j - 1] + 1), prev[j - 1] + cost);
+                    cur[j] = v;
+                    if (v < rowMin) rowMin = v;
+                }
+                if (rowMin > max) return max + 1;
+                int[] t = prev; prev = cur; cur = t;
+            }
+            return prev[b.Length];
+        }
+
+        static void IndexAdd(Dictionary<string, List<string>> idx, string k, string key)
+        {
+            List<string> l;
+            if (!idx.TryGetValue(k, out l)) { l = new List<string>(); idx[k] = l; }
+            l.Add(key);
+            if (l.Count > 40) l.RemoveAt(0);
+        }
+
+        static void IndexRemove(Dictionary<string, List<string>> idx, string k, string key)
+        {
+            List<string> l;
+            if (idx.TryGetValue(k, out l)) { l.Remove(key); if (l.Count == 0) idx.Remove(k); }
+        }
+
+        static bool Indexable(string sq)
+        {
+            return sq.Length >= 40 && sq.Length <= 600;
+        }
+
+        static void MemAdd(string key, string value, bool dirty)
+        {
+            lock (memory)
+            {
+                if (memory.ContainsKey(key))
+                {
+                    memory[key] = value;
+                    if (dirty) memDirty = true;
+                    return;
+                }
+                memory[key] = value;
+                memOrder.Enqueue(key);
+                string sq = Squeeze(key);
+                squeezed[key] = sq;
+                if (sq.Length >= 6) bySqueezed[sq] = key;
+                if (Indexable(sq))
+                {
+                    IndexAdd(idxHead, sq.Substring(0, 5), key);
+                    IndexAdd(idxTail, sq.Substring(sq.Length - 5), key);
+                }
+                while (memory.Count > MaxMemory && memOrder.Count > 0)
+                {
+                    string old = memOrder.Dequeue();
+                    string osq;
+                    if (squeezed.TryGetValue(old, out osq))
+                    {
+                        if (Indexable(osq))
+                        {
+                            IndexRemove(idxHead, osq.Substring(0, 5), old);
+                            IndexRemove(idxTail, osq.Substring(osq.Length - 5), old);
+                        }
+                        string cur;
+                        if (bySqueezed.TryGetValue(osq, out cur) && cur == old) bySqueezed.Remove(osq);
+                        squeezed.Remove(old);
+                    }
+                    memory.Remove(old);
+                }
+                if (dirty) memDirty = true;
+            }
+        }
+
+        // 같은 문장이거나, 공백·대소문자·OCR 오인식 수준의 차이만 있는 문장이 이미 번역돼 있으면 그 번역을 돌려줘요.
+        // 숫자가 다르면(점수, 시간 등) 절대 재사용하지 않아요.
+        static bool MemLookup(string key, out string value)
+        {
+            lock (memory)
+            {
+                if (memory.TryGetValue(key, out value)) return true;
+                value = null;
+                string sq = Squeeze(key);
+                if (sq.Length < 6) return false;
+                string digits = DigitsOf(key);
+                string k0;
+                if (bySqueezed.TryGetValue(sq, out k0) && DigitsOf(k0) == digits)
+                {
+                    value = memory[k0];
+                    return true;
+                }
+                if (!Indexable(sq)) return false;
+                // 긴 문단은 OCR이 한두 글자 틀려도(문장 길이의 3% 이내) 같은 문장으로 봐요
+                int maxD = 1 + (sq.Length - 40) / 80;
+                List<string> cand = new List<string>();
+                List<string> l;
+                if (idxHead.TryGetValue(sq.Substring(0, 5), out l)) cand.AddRange(l);
+                if (idxTail.TryGetValue(sq.Substring(sq.Length - 5), out l)) cand.AddRange(l);
+                int bestD = int.MaxValue;
+                foreach (string k in cand)
+                {
+                    string ksq;
+                    if (!squeezed.TryGetValue(k, out ksq)) continue;
+                    if (DigitsOf(k) != digits) continue;
+                    int d = Lev(sq, ksq, maxD);
+                    if (d <= maxD && d < bestD) { bestD = d; value = memory[k]; }
+                }
+                return value != null;
+            }
+        }
+
+        static string MemPath()
+        {
+            return Path.Combine(AppInfo.DataDir(), "memory.tsv");
+        }
+
+        static string Esc(string s)
+        {
+            return s.Replace("\\", "\\\\").Replace("\t", "\\t").Replace("\r", "\\r").Replace("\n", "\\n");
+        }
+
+        static string Unesc(string s)
+        {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c == '\\' && i + 1 < s.Length)
+                {
+                    char n = s[++i];
+                    sb.Append(n == 't' ? '\t' : (n == 'n' ? '\n' : (n == 'r' ? '\r' : n)));
+                }
+                else sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        public static void LoadMemory()
+        {
+            try
+            {
+                string p = MemPath();
+                if (!File.Exists(p)) return;
+                foreach (string line in File.ReadAllLines(p, Encoding.UTF8))
+                {
+                    int t = line.IndexOf('\t');
+                    if (t <= 0) continue;
+                    MemAdd(Unesc(line.Substring(0, t)), Unesc(line.Substring(t + 1)), false);
+                }
+            }
+            catch { }
+        }
+
+        // force=false: 바뀐 게 있을 때 30초에 한 번만 저장 / force=true: 바로 저장 (종료할 때)
+        public static void SaveMemory(bool force)
+        {
+            try
+            {
+                List<string> lines;
+                lock (memory)
+                {
+                    if (!memDirty) return;
+                    if (!force && (DateTime.UtcNow - lastSave).TotalSeconds < 30) return;
+                    lines = new List<string>(memory.Count);
+                    foreach (string k in memOrder)
+                    {
+                        string v;
+                        if (memory.TryGetValue(k, out v)) lines.Add(Esc(k) + "\t" + Esc(v));
+                    }
+                    memDirty = false;
+                    lastSave = DateTime.UtcNow;
+                }
+                string p = MemPath();
+                string tmp = p + ".tmp";
+                File.WriteAllLines(tmp, lines.ToArray(), new UTF8Encoding(false));
+                if (File.Exists(p)) File.Delete(p);
+                File.Move(tmp, p);
+            }
+            catch { }
+        }
+
+        public static int MemoryCount()
+        {
+            lock (memory) { return memory.Count; }
+        }
+
+        public static void ClearMemory()
+        {
+            lock (memory)
+            {
+                memory.Clear();
+                squeezed.Clear();
+                bySqueezed.Clear();
+                idxHead.Clear();
+                idxTail.Clear();
+                memOrder.Clear();
+                memDirty = false;
+            }
+            SavedChars = 0;
+            MemoryHits = 0;
+            try { if (File.Exists(MemPath())) File.Delete(MemPath()); } catch { }
+        }
+
         // 번역이 필요 없거나 실패한 항목은 null. 실패 이유는 LastError 에 남아요.
         public static string[] ToKorean(List<string> texts)
         {
             string[] result = new string[texts.Count];
-            List<int> miss = new List<int>();
-            lock (cache)
+            Dictionary<string, List<int>> pending = new Dictionary<string, List<int>>();
+            List<string> uniq = new List<string>();
+            for (int i = 0; i < texts.Count; i++)
             {
-                for (int i = 0; i < texts.Count; i++)
+                string key = Norm(texts[i]);
+                string hit;
+                if (MemLookup(key, out hit))
                 {
-                    string hit;
-                    if (cache.TryGetValue(texts[i], out hit)) result[i] = hit.Length == 0 ? null : hit;
-                    else miss.Add(i);
+                    result[i] = hit.Length == 0 ? null : hit;
+                    SavedChars += key.Length;
+                    MemoryHits++;
+                    continue;
                 }
+                List<int> l;
+                if (!pending.TryGetValue(key, out l)) { l = new List<int>(); pending[key] = l; uniq.Add(key); }
+                l.Add(i);
             }
-            if (miss.Count == 0) { LastError = ""; return result; }
+            if (uniq.Count == 0) { LastError = ""; return result; }
 
             lock (gate)
             {
                 int pos = 0;
-                while (pos < miss.Count)
+                while (pos < uniq.Count)
                 {
-                    List<int> idx = new List<int>();
+                    List<string> part = new List<string>();
                     int chars = 0;
-                    while (pos < miss.Count)
+                    while (pos < uniq.Count)
                     {
-                        int len = texts[miss[pos]].Length + 1;
-                        if (idx.Count > 0 && (chars + len > 3500 || idx.Count >= 40)) break;
-                        idx.Add(miss[pos]);
+                        int len = uniq[pos].Length + 1;
+                        if (part.Count > 0 && (chars + len > 3500 || part.Count >= 40)) break;
+                        part.Add(uniq[pos]);
                         chars += len;
                         pos++;
                     }
-                    List<string> part = new List<string>();
-                    foreach (int i in idx) part.Add(texts[i]);
                     string[] outp = TranslateChunk(part);
                     if (outp == null) return result; // 실패: 지금까지 된 것만 돌려줘요 (이유는 LastError)
-                    lock (cache)
+                    for (int k = 0; k < part.Count; k++)
                     {
-                        if (cache.Count > 3000) cache.Clear();
-                        for (int k = 0; k < idx.Count; k++)
-                        {
-                            string o = outp[k] ?? "";
-                            if (string.Equals(o.Trim(), texts[idx[k]].Trim(), StringComparison.OrdinalIgnoreCase)) o = "";
-                            cache[texts[idx[k]]] = o;
-                            result[idx[k]] = o.Length == 0 ? null : o;
-                        }
+                        string o = outp[k] ?? "";
+                        if (string.Equals(o.Trim(), part[k].Trim(), StringComparison.OrdinalIgnoreCase)) o = "";
+                        MemAdd(part[k], o, true);
+                        foreach (int idx in pending[part[k]]) result[idx] = o.Length == 0 ? null : o;
                     }
                 }
             }
@@ -749,10 +1015,109 @@ namespace ScreenTranslatorApp
 
     class Item
     {
-        public RectangleF Rect;
+        public RectangleF Rect;       // 원문이 있던 자리 (번역문은 이 안에만 그려요)
         public string Text;
-        public int Lines = 1;
+        public int Lines = 1;         // 원문 줄 수
+        public float LineH;           // 원문 한 줄의 높이 (= 글자 크기에 가까워요)
         public Color Bg, Fg;
+        public float FontSize;        // 배치 결과: 글자 크기
+        public List<string> Wrapped;  // 배치 결과: 줄바꿈된 문장들
+    }
+
+    // 화면 픽셀을 한 번에 읽어 두는 도우미 (GetPixel 을 반복 호출하면 느려요)
+    class Pix
+    {
+        public int W, H;
+        int[] data;
+
+        public Pix(Bitmap b)
+        {
+            W = b.Width;
+            H = b.Height;
+            System.Drawing.Imaging.BitmapData bd = b.LockBits(new Rectangle(0, 0, W, H),
+                System.Drawing.Imaging.ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            data = new int[W * H];
+            try { Marshal.Copy(bd.Scan0, data, 0, data.Length); }
+            finally { b.UnlockBits(bd); }
+        }
+
+        public Color At(int x, int y)
+        {
+            if (x < 0) x = 0;
+            if (y < 0) y = 0;
+            if (x >= W) x = W - 1;
+            if (y >= H) y = H - 1;
+            int v = data[y * W + x];
+            return Color.FromArgb((v >> 16) & 255, (v >> 8) & 255, v & 255);
+        }
+
+        // 글자 상자 바로 바깥 테두리에서 가장 흔한 색 = 배경색
+        public Color Background(RectangleF r)
+        {
+            int x0 = (int)Math.Floor(r.Left) - 2, y0 = (int)Math.Floor(r.Top) - 2;
+            int x1 = (int)Math.Ceiling(r.Right) + 2, y1 = (int)Math.Ceiling(r.Bottom) + 2;
+            int stepX = Math.Max(1, (x1 - x0) / 40), stepY = Math.Max(1, (y1 - y0) / 20);
+            List<Color> samples = new List<Color>();
+            for (int x = x0; x <= x1; x += stepX) { samples.Add(At(x, y0)); samples.Add(At(x, y1)); }
+            for (int y = y0; y <= y1; y += stepY) { samples.Add(At(x0, y)); samples.Add(At(x1, y)); }
+            Dictionary<int, int> count = new Dictionary<int, int>();
+            int bestKey = 0, bestCnt = -1;
+            foreach (Color c in samples)
+            {
+                int key = ((c.R >> 4) << 8) | ((c.G >> 4) << 4) | (c.B >> 4);
+                int n;
+                count.TryGetValue(key, out n);
+                n++;
+                count[key] = n;
+                if (n > bestCnt) { bestCnt = n; bestKey = key; }
+            }
+            long sr = 0, sg = 0, sb = 0, m = 0;
+            foreach (Color c in samples)
+            {
+                int key = ((c.R >> 4) << 8) | ((c.G >> 4) << 4) | (c.B >> 4);
+                if (key != bestKey) continue;
+                sr += c.R; sg += c.G; sb += c.B; m++;
+            }
+            if (m == 0) return Color.White;
+            return Color.FromArgb((int)(sr / m), (int)(sg / m), (int)(sb / m));
+        }
+
+        static double Lin(int v)
+        {
+            double c = v / 255.0;
+            return c <= 0.03928 ? c / 12.92 : Math.Pow((c + 0.055) / 1.055, 2.4);
+        }
+
+        static double Rel(Color c)
+        {
+            return 0.2126 * Lin(c.R) + 0.7152 * Lin(c.G) + 0.0722 * Lin(c.B);
+        }
+
+        static double Contrast(Color a, Color b)
+        {
+            double la = Rel(a), lb = Rel(b);
+            double hi = Math.Max(la, lb), lo = Math.Min(la, lb);
+            return (hi + 0.05) / (lo + 0.05);
+        }
+
+        // 상자 안에서 배경과 가장 다른 색 = 원문 글자색. 대비가 부족하면 검정/흰색.
+        public Color Foreground(RectangleF r, Color bg)
+        {
+            int stepX = Math.Max(1, (int)(r.Width / 60)), stepY = Math.Max(1, (int)(r.Height / 8));
+            long best = -1;
+            Color bc = bg;
+            for (int y = (int)r.Top; y < (int)r.Bottom; y += stepY)
+                for (int x = (int)r.Left; x < (int)r.Right; x += stepX)
+                {
+                    Color c = At(x, y);
+                    long dr = c.R - bg.R, dg = c.G - bg.G, db = c.B - bg.B;
+                    long d = dr * dr + dg * dg + db * db;
+                    if (d > best) { best = d; bc = c; }
+                }
+            if (best >= 0 && Contrast(bc, bg) >= 3.0) return bc;
+            double lum = 0.299 * bg.R + 0.587 * bg.G + 0.114 * bg.B;
+            return lum > 140 ? Color.FromArgb(20, 20, 20) : Color.FromArgb(244, 244, 244);
+        }
     }
 
     static class OcrService
@@ -787,6 +1152,16 @@ namespace ScreenTranslatorApp
 
         static readonly Regex CjkSpace = new Regex(
             @"(?<=[\u3000-\u30ff\u3400-\u9fff\uff00-\uffef]) +(?=[\u3000-\u30ff\u3400-\u9fff\uff00-\uffef])", RegexOptions.Compiled);
+
+        static readonly Regex ZeroWidth = new Regex(@"[\u200b-\u200f\u2028\u2029\ufeff]", RegexOptions.Compiled);
+        static readonly Regex MultiSpace = new Regex(@"\s{2,}", RegexOptions.Compiled);
+
+        static string Clean(string s)
+        {
+            s = ZeroWidth.Replace(s, "");
+            s = MultiSpace.Replace(s, " ");
+            return s.Trim();
+        }
 
         // System.Runtime.WindowsRuntime.dll 의 AsTask() 대신 직접 완료를 기다려요 (참조 충돌 회피)
         static T Await<T>(Windows.Foundation.IAsyncOperation<T> op)
@@ -826,7 +1201,7 @@ namespace ScreenTranslatorApp
                             if (r.Y + r.Height > y1) y1 = r.Y + r.Height;
                         }
                         if (x1 <= x0 || y1 <= y0) continue;
-                        string t = CjkSpace.Replace(ln.Text, "").Trim();
+                        string t = Clean(CjkSpace.Replace(ln.Text, ""));
                         if (t.Length == 0) continue;
                         LineInfo li = new LineInfo();
                         li.Text = t;
@@ -901,7 +1276,7 @@ namespace ScreenTranslatorApp
             public string Text;
             public RectangleF Rect;
             public int Lines = 1;
-            public double LastH;
+            public double LastH, SumH, LastW, MaxW;
         }
 
         static bool EndsSentence(string s)
@@ -909,6 +1284,16 @@ namespace ScreenTranslatorApp
             if (s.Length == 0) return false;
             char c = s[s.Length - 1];
             return ".!?:;。！？：".IndexOf(c) >= 0;
+        }
+
+        static readonly Regex NumberedItem = new Regex(@"^(\(?\d{1,3}[\.\)]|\(?[A-Za-z][\.\)])\s", RegexOptions.Compiled);
+
+        // 글머리 기호(•, -, 1. 등)로 시작하는 줄은 새 문단이에요
+        static bool IsBullet(string s)
+        {
+            if (s.Length == 0) return false;
+            if ("•·▪■□◆◇●○-–—*>»›▶►".IndexOf(s[0]) >= 0 && (s.Length == 1 || s[1] == ' ')) return true;
+            return NumberedItem.IsMatch(s);
         }
 
         static List<Para> Merge(List<LineInfo> lines)
@@ -923,16 +1308,28 @@ namespace ScreenTranslatorApp
                     double h = li.Rect.Height;
                     double gap = li.Rect.Top - cur.Rect.Bottom;
                     double ratio = h > cur.LastH ? h / cur.LastH : cur.LastH / h;
-                    join = !EndsSentence(cur.Text) && gap < 0.6 * h && gap > -0.5 * h &&
+                    join = !EndsSentence(cur.Text) && !IsBullet(li.Text) &&
+                           gap < 0.6 * h && gap > -0.5 * h &&
                            Math.Abs(li.Rect.Left - cur.Rect.Left) < 2.0 * h && ratio < 1.35;
+                    // 앞줄이 다음 줄보다 훨씬 짧으면 제목·라벨이거나 문단의 끝이에요
+                    if (join && cur.LastW < 0.6 * li.Rect.Width) join = false;
+                    if (join && cur.Lines >= 2 && cur.LastW < 0.5 * cur.MaxW) join = false;
                 }
                 if (join)
                 {
+                    string t = cur.Text;
                     bool cjk = li.Text.Length > 0 && li.Text[0] >= 0x3000;
-                    cur.Text = cur.Text + (cjk ? "" : " ") + li.Text;
+                    // 줄 끝 하이픈으로 쪼개진 단어는 붙여요 (trans- lation → translation)
+                    if (t.Length > 2 && t[t.Length - 1] == '-' && char.IsLetter(t[t.Length - 2]) && li.Text.Length > 0 && char.IsLower(li.Text[0]))
+                        cur.Text = t.Substring(0, t.Length - 1) + li.Text;
+                    else
+                        cur.Text = t + (cjk ? "" : " ") + li.Text;
                     cur.Rect = RectangleF.Union(cur.Rect, li.Rect);
                     cur.Lines++;
                     cur.LastH = li.Rect.Height;
+                    cur.SumH += li.Rect.Height;
+                    cur.LastW = li.Rect.Width;
+                    if (li.Rect.Width > cur.MaxW) cur.MaxW = li.Rect.Width;
                 }
                 else
                 {
@@ -940,25 +1337,13 @@ namespace ScreenTranslatorApp
                     cur.Text = li.Text;
                     cur.Rect = li.Rect;
                     cur.LastH = li.Rect.Height;
+                    cur.SumH = li.Rect.Height;
+                    cur.LastW = li.Rect.Width;
+                    cur.MaxW = li.Rect.Width;
                     res.Add(cur);
                 }
             }
             return res;
-        }
-
-        static Color Sample(Bitmap bmp, RectangleF r)
-        {
-            int[] xs = { (int)r.Left - 3, (int)r.Right + 3, (int)(r.Left + r.Width / 2), (int)(r.Left + r.Width / 2), (int)r.Left - 3, (int)r.Right + 3 };
-            int[] ys = { (int)r.Top - 3, (int)r.Bottom + 3, (int)r.Top - 3, (int)r.Bottom + 3, (int)(r.Top + r.Height / 2), (int)(r.Top + r.Height / 2) };
-            int sr = 0, sg = 0, sb = 0, n = 0;
-            for (int i = 0; i < xs.Length; i++)
-            {
-                int x = Math.Max(0, Math.Min(bmp.Width - 1, xs[i]));
-                int y = Math.Max(0, Math.Min(bmp.Height - 1, ys[i]));
-                Color c = bmp.GetPixel(x, y);
-                sr += c.R; sg += c.G; sb += c.B; n++;
-            }
-            return Color.FromArgb(sr / n, sg / n, sb / n);
         }
 
         public static List<Item> Process(Bitmap bmp, bool detect, out string error)
@@ -976,16 +1361,21 @@ namespace ScreenTranslatorApp
             if (todo.Count > 0 && Translator.LastError.Length > 0) error = Translator.LastError;
 
             List<Item> items = new List<Item>();
+            Pix pix = null;
+            RectangleF bounds = new RectangleF(0, 0, bmp.Width, bmp.Height);
             for (int i = 0; i < todo.Count; i++)
             {
                 if (string.IsNullOrEmpty(outText[i])) continue;
+                RectangleF r = RectangleF.Intersect(todo[i].Rect, bounds);
+                if (r.Width < 2 || r.Height < 2) continue;
+                if (pix == null) pix = new Pix(bmp);
                 Item it = new Item();
-                it.Rect = todo[i].Rect;
+                it.Rect = r;
                 it.Text = outText[i];
                 it.Lines = todo[i].Lines;
-                it.Bg = Sample(bmp, todo[i].Rect);
-                double lum = 0.299 * it.Bg.R + 0.587 * it.Bg.G + 0.114 * it.Bg.B;
-                it.Fg = lum > 140 ? Color.FromArgb(20, 20, 20) : Color.FromArgb(244, 244, 244);
+                it.LineH = (float)(todo[i].SumH / todo[i].Lines);
+                it.Bg = pix.Background(r);
+                it.Fg = pix.Foreground(r, it.Bg);
                 items.Add(it);
             }
             return items;
@@ -1080,17 +1470,16 @@ namespace ScreenTranslatorApp
     }
 
     // ------------------------------------------------------------------ translated overlay
+    // 번역 화면은 항상 "클릭 통과"예요. 아래 화면을 그대로 클릭·스크롤·입력할 수 있어요.
     class OverlayForm : Form
     {
         List<Item> items = new List<Item>();
         string status = "";
-        bool clickThrough;
         public bool ExcludedFromCapture;
-        public event Action Dismissed;
+        static readonly Color KeyColor = Color.FromArgb(1, 2, 3);
 
-        public OverlayForm(Rectangle bounds, bool clickThrough)
+        public OverlayForm(Rectangle bounds)
         {
-            this.clickThrough = clickThrough;
             FormBorderStyle = FormBorderStyle.None;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.Manual;
@@ -1101,8 +1490,6 @@ namespace ScreenTranslatorApp
             SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
         }
-
-        static readonly Color KeyColor = Color.FromArgb(1, 2, 3);
 
         protected override CreateParams CreateParams
         {
@@ -1119,11 +1506,8 @@ namespace ScreenTranslatorApp
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
-            if (clickThrough)
-            {
-                int ex = Native.GetWindowLong(Handle, Native.GWL_EXSTYLE);
-                Native.SetWindowLong(Handle, Native.GWL_EXSTYLE, ex | Native.WS_EX_TRANSPARENT | Native.WS_EX_LAYERED);
-            }
+            int ex = Native.GetWindowLong(Handle, Native.GWL_EXSTYLE);
+            Native.SetWindowLong(Handle, Native.GWL_EXSTYLE, ex | Native.WS_EX_TRANSPARENT | Native.WS_EX_LAYERED);
             try { ExcludedFromCapture = Native.SetWindowDisplayAffinity(Handle, Native.WDA_EXCLUDEFROMCAPTURE); }
             catch { ExcludedFromCapture = false; }
         }
@@ -1136,15 +1520,70 @@ namespace ScreenTranslatorApp
 
         public void SetContent(List<Item> list, string st)
         {
+            using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
+            {
+                foreach (Item it in list) Layout(g, it);
+            }
             items = list;
             status = st;
             Invalidate();
         }
 
-        protected override void OnMouseDown(MouseEventArgs e)
+        // ---- 배치: 번역문이 원문 상자(가로·세로) 밖으로 절대 나가지 않게 글자 크기를 맞춰요 ----
+        static List<string> Wrap(string text, float limit, Func<string, float> w)
         {
-            base.OnMouseDown(e);
-            if (Dismissed != null) Dismissed();
+            List<string> lines = new List<string>();
+            string[] words = text.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            string cur = "";
+            foreach (string word0 in words)
+            {
+                string word = word0;
+                string trial = cur.Length == 0 ? word : cur + " " + word;
+                if (w(trial) <= limit) { cur = trial; continue; }
+                if (cur.Length > 0) { lines.Add(cur); cur = ""; }
+                while (w(word) > limit && word.Length > 1)
+                {
+                    int n = word.Length;
+                    while (n > 1 && w(word.Substring(0, n)) > limit) n--;
+                    lines.Add(word.Substring(0, n));
+                    word = word.Substring(n);
+                }
+                cur = word;
+            }
+            if (cur.Length > 0) lines.Add(cur);
+            if (lines.Count == 0) lines.Add("");
+            return lines;
+        }
+
+        static void Layout(Graphics g, Item it)
+        {
+            RectangleF box = it.Rect;
+            float s0 = Math.Max(8f, Math.Min(it.LineH * 1.05f, 72f)); // 원문 글자 크기보다 커지지 않아요
+            using (Font refFont = new Font("Malgun Gothic", 100f, FontStyle.Regular, GraphicsUnit.Pixel))
+            using (StringFormat sf = new StringFormat(StringFormat.GenericTypographic))
+            {
+                sf.FormatFlags |= StringFormatFlags.MeasureTrailingSpaces;
+                Dictionary<string, float> widths = new Dictionary<string, float>();
+                // 글자 폭은 크기에 비례하므로 100px 기준으로 한 번만 재요
+                Func<string, float> w100 = delegate (string s)
+                {
+                    float v;
+                    if (widths.TryGetValue(s, out v)) return v;
+                    v = g.MeasureString(s, refFont, 1000000, sf).Width;
+                    widths[s] = v;
+                    return v;
+                };
+                float size = s0;
+                List<string> lines;
+                while (true)
+                {
+                    lines = Wrap(it.Text, box.Width * 100f / size, w100);
+                    if (lines.Count * size * 1.1f <= box.Height + 0.5f || size <= 8f) break;
+                    size -= 0.5f;
+                }
+                it.FontSize = size;
+                it.Wrapped = lines;
+            }
         }
 
         protected override void OnPaintBackground(PaintEventArgs e) { }
@@ -1155,29 +1594,33 @@ namespace ScreenTranslatorApp
             g.Clear(KeyColor); // 키 색상 = 투명, 번역 박스만 불투명하게 그려요
             g.SmoothingMode = SmoothingMode.None;
             g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
-            foreach (Item it in items)
+            RectangleF all = new RectangleF(0, 0, ClientSize.Width, ClientSize.Height);
+            using (StringFormat sf = new StringFormat(StringFormat.GenericTypographic))
             {
-                RectangleF r = RectangleF.Inflate(it.Rect, 3f, 2f);
-                float h = it.Rect.Height / Math.Max(1, it.Lines);
-                float size = Math.Max(9f, Math.Min(h * 0.82f, 40f));
-                using (SolidBrush bg = new SolidBrush(it.Bg))
-                using (SolidBrush fg = new SolidBrush(it.Fg))
+                sf.FormatFlags |= StringFormatFlags.NoWrap;
+                sf.Trimming = StringTrimming.None;
+                sf.Alignment = StringAlignment.Near;
+                sf.LineAlignment = StringAlignment.Center;
+                foreach (Item it in items)
                 {
-                    while (true)
+                    if (it.Wrapped == null) continue;
+                    // 원문 글자가 삐져나오지 않도록 가장자리만 2px/1px 더 덮고, 그 밖으로는 나가지 않아요
+                    RectangleF cover = RectangleF.Inflate(it.Rect, 2f, 1f);
+                    cover.Intersect(all);
+                    if (cover.Width <= 0 || cover.Height <= 0) continue;
+                    using (SolidBrush bg = new SolidBrush(it.Bg)) g.FillRectangle(bg, cover);
+                    g.SetClip(cover);
+                    float slot = it.Rect.Height / it.Wrapped.Count;
+                    using (Font f = new Font("Malgun Gothic", it.FontSize, FontStyle.Regular, GraphicsUnit.Pixel))
+                    using (SolidBrush fg = new SolidBrush(it.Fg))
                     {
-                        using (Font f = new Font("Malgun Gothic", size, FontStyle.Regular, GraphicsUnit.Pixel))
+                        for (int i = 0; i < it.Wrapped.Count; i++)
                         {
-                            SizeF m = g.MeasureString(it.Text, f, (int)r.Width);
-                            if (m.Height <= r.Height + 2 || size <= 9f)
-                            {
-                                RectangleF fill = new RectangleF(r.X, r.Y, r.Width, Math.Max(r.Height, m.Height + 2));
-                                g.FillRectangle(bg, fill);
-                                g.DrawString(it.Text, f, fg, new RectangleF(r.X, r.Y + 1, r.Width, fill.Height));
-                                break;
-                            }
+                            RectangleF line = new RectangleF(it.Rect.Left, it.Rect.Top + i * slot, it.Rect.Width + 2f, slot);
+                            g.DrawString(it.Wrapped[i], f, fg, line, sf);
                         }
-                        size -= 1f;
                     }
+                    g.ResetClip();
                 }
             }
             if (status.Length > 0)
@@ -1196,7 +1639,7 @@ namespace ScreenTranslatorApp
     // ------------------------------------------------------------------ app info / self update
     static class AppInfo
     {
-        public const int AppVersion = 4;
+        public const int AppVersion = 5;
 
         public static string DataDir()
         {
@@ -1499,13 +1942,21 @@ namespace ScreenTranslatorApp
     {
         ComboBox cbInterval;
         TextBox tbKey;
-        CheckBox ckAuto, ckUpd;
+        CheckBox ckAuto, ckUpd, ckClear;
+        Label lbMem;
         int[] intervals = { 1000, 1500, 3000, 5000 };
 
         public int IntervalMs { get { return intervals[Math.Max(0, cbInterval.SelectedIndex)]; } }
         public string DeepLKeyValue { get { return tbKey.Text.Trim(); } }
         public bool AutoStartValue { get { return ckAuto.Checked; } }
         public bool AutoUpdateValue { get { return ckUpd.Checked; } }
+        public bool AutoClearValue { get { return ckClear.Checked; } }
+
+        void RefreshMem()
+        {
+            lbMem.Text = "저장된 번역 " + Translator.MemoryCount() + "개  ·  이번 실행에서 다시 쓴 번역 " + Translator.MemoryHits +
+                         "번 (글자 약 " + Translator.SavedChars + "자 절약)";
+        }
 
         public SettingsForm(Settings st, bool autoStart, Action checkUpdate, Action editUrl)
         {
@@ -1516,21 +1967,21 @@ namespace ScreenTranslatorApp
             MaximizeBox = false;
             MinimizeBox = false;
             ShowInTaskbar = false;
-            ClientSize = new Size(460, 478);
+            ClientSize = new Size(460, 594);
 
-            // --- 실시간 번역
+            // --- 번역 동작
             GroupBox g1 = new GroupBox();
-            g1.Text = "실시간 번역";
-            g1.SetBounds(14, 10, 432, 64);
+            g1.Text = "번역 동작";
+            g1.SetBounds(14, 10, 432, 92);
             Controls.Add(g1);
             Label l1 = new Label();
-            l1.Text = "화면 확인 주기";
-            l1.SetBounds(14, 30, 110, 20);
+            l1.Text = "실시간 화면 확인 주기";
+            l1.SetBounds(14, 30, 130, 20);
             g1.Controls.Add(l1);
             cbInterval = new ComboBox();
             cbInterval.DropDownStyle = ComboBoxStyle.DropDownList;
             cbInterval.Items.AddRange(new object[] { "1초", "1.5초", "3초", "5초" });
-            cbInterval.SetBounds(130, 26, 110, 24);
+            cbInterval.SetBounds(150, 26, 100, 24);
             int sel = 1, best = int.MaxValue;
             for (int i = 0; i < intervals.Length; i++)
             {
@@ -1542,13 +1993,18 @@ namespace ScreenTranslatorApp
             Label l1b = new Label();
             l1b.Text = "화면이 바뀔 때만 번역해요";
             l1b.ForeColor = SystemColors.GrayText;
-            l1b.SetBounds(250, 30, 170, 20);
+            l1b.SetBounds(258, 30, 160, 20);
             g1.Controls.Add(l1b);
+            ckClear = new CheckBox();
+            ckClear.Text = "한 번 번역한 화면이 바뀌면(스크롤 등) 번역을 자동으로 지우기";
+            ckClear.Checked = st.AutoClear;
+            ckClear.SetBounds(14, 60, 408, 22);
+            g1.Controls.Add(ckClear);
 
             // --- 번역 엔진
             GroupBox g2 = new GroupBox();
             g2.Text = "번역 엔진";
-            g2.SetBounds(14, 84, 432, 186);
+            g2.SetBounds(14, 112, 432, 186);
             Controls.Add(g2);
             Label l2 = new Label();
             l2.Text = "기본은 무료 번역(Microsoft → Google → Lingva 순서로 자동 선택)이에요. 그래도 막히면 DeepL 무료 API 키를 넣어 주세요 (월 50만 자 무료, 키는 이 PC에만 저장). '번역 테스트'로 엔진별 상태를 볼 수 있어요.";
@@ -1588,10 +2044,39 @@ namespace ScreenTranslatorApp
             };
             g2.Controls.Add(bTest);
 
+            // --- 번역 메모리
+            GroupBox gm = new GroupBox();
+            gm.Text = "번역 메모리 (한 번 번역한 문장은 다시 요청하지 않아요)";
+            gm.SetBounds(14, 308, 432, 78);
+            Controls.Add(gm);
+            lbMem = new Label();
+            lbMem.SetBounds(14, 22, 404, 20);
+            gm.Controls.Add(lbMem);
+            Button bMem1 = new Button();
+            bMem1.Text = "메모리 폴더 열기";
+            bMem1.SetBounds(14, 44, 140, 26);
+            bMem1.Click += delegate
+            {
+                try { Process.Start(AppInfo.DataDir()); } catch { }
+            };
+            gm.Controls.Add(bMem1);
+            Button bMem2 = new Button();
+            bMem2.Text = "메모리 지우기";
+            bMem2.SetBounds(162, 44, 120, 26);
+            bMem2.Click += delegate
+            {
+                if (MessageBox.Show(this, "저장된 번역을 모두 지울까요?\n(지우면 같은 문장도 다시 번역 요청을 보내요)", "번역 메모리",
+                        MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+                Translator.ClearMemory();
+                RefreshMem();
+            };
+            gm.Controls.Add(bMem2);
+            RefreshMem();
+
             // --- 일반
             GroupBox g3 = new GroupBox();
             g3.Text = "일반";
-            g3.SetBounds(14, 280, 432, 144);
+            g3.SetBounds(14, 396, 432, 144);
             Controls.Add(g3);
             ckAuto = new CheckBox();
             ckAuto.Text = "Windows 시작 시 자동 실행";
@@ -1630,12 +2115,12 @@ namespace ScreenTranslatorApp
 
             Button ok2 = new Button();
             ok2.Text = "저장";
-            ok2.SetBounds(270, 436, 86, 30);
+            ok2.SetBounds(270, 552, 86, 30);
             ok2.DialogResult = DialogResult.OK;
             Controls.Add(ok2);
             Button cancel = new Button();
             cancel.Text = "취소";
-            cancel.SetBounds(362, 436, 86, 30);
+            cancel.SetBounds(362, 552, 86, 30);
             cancel.DialogResult = DialogResult.Cancel;
             Controls.Add(cancel);
             AcceptButton = ok2;
@@ -1655,8 +2140,9 @@ namespace ScreenTranslatorApp
 
         OverlayForm overlay;
         bool liveOn, liveBusy, updBusy, oldCleaned, hintShown;
-        Rectangle liveRect;
-        byte[] lastSig;
+        Rectangle liveRect, watchRect;
+        byte[] lastSig, baseSig;
+        System.Windows.Forms.Timer watchTimer;
         int jobId;
         DateTime startTime = DateTime.UtcNow;
         DateTime nextUpd = DateTime.UtcNow.AddSeconds(30);
@@ -1665,6 +2151,7 @@ namespace ScreenTranslatorApp
         {
             st = Settings.Load();
             Translator.DeepLKey = st.DeepLKey;
+            Translator.LoadMemory();
             ShowInTaskbar = false;
             FormBorderStyle = FormBorderStyle.None;
             Opacity = 0;
@@ -1705,6 +2192,9 @@ namespace ScreenTranslatorApp
             updTimer.Interval = 5000;
             updTimer.Tick += OnUpdTick;
             updTimer.Start();
+            watchTimer = new System.Windows.Forms.Timer();
+            watchTimer.Interval = 900;
+            watchTimer.Tick += OnWatchTick;
 
             if (Program.JustUpdated)
                 Notify("화면 번역기", "v" + AppInfo.AppVersion + " 로 업데이트됐어요");
@@ -1854,6 +2344,7 @@ namespace ScreenTranslatorApp
                 Translator.DeepLKey = st.DeepLKey;
                 if (keyChanged) Translator.ResetCooldown();
                 st.AutoUpdate = f.AutoUpdateValue;
+                st.AutoClear = f.AutoClearValue;
                 if (f.AutoStartValue != GetAutoStart()) SetAutoStart(f.AutoStartValue);
                 st.Save();
                 panel.SetStatus("설정을 저장했어요");
@@ -1899,10 +2390,34 @@ namespace ScreenTranslatorApp
 
         static bool Changed(byte[] a, byte[] b)
         {
+            return Changed(a, b, 500);
+        }
+
+        static bool Changed(byte[] a, byte[] b, int limit)
+        {
             if (a == null || b == null) return true;
             int d = 0;
             for (int i = 0; i < a.Length; i++) d += Math.Abs(a[i] - b[i]);
-            return d > 500;
+            return d > limit;
+        }
+
+        // 한 번 번역한 화면이 스크롤 등으로 바뀌면 낡은 번역을 자동으로 지워요
+        void OnWatchTick(object sender, EventArgs e)
+        {
+            if (overlay == null || liveOn || baseSig == null) { watchTimer.Stop(); return; }
+            bool hidden = false;
+            if (!overlay.ExcludedFromCapture) { overlay.Opacity = 0; hidden = true; Application.DoEvents(); Thread.Sleep(30); }
+            Bitmap bmp;
+            try { bmp = CaptureClean(watchRect); }
+            finally { if (hidden && overlay != null) overlay.Opacity = 1; }
+            byte[] sig = Signature(bmp);
+            bmp.Dispose();
+            if (Changed(baseSig, sig, 1800))
+            {
+                watchTimer.Stop();
+                CloseOverlay();
+                panel.SetStatus("화면이 바뀌어서 번역을 지웠어요");
+            }
         }
 
         // ---------- translate flows ----------
@@ -1910,6 +2425,7 @@ namespace ScreenTranslatorApp
         {
             liveOn = false;
             liveTimer.Stop();
+            watchTimer.Stop();
             jobId++;
             CloseOverlay();
             panel.SetLive(false);
@@ -1961,8 +2477,10 @@ namespace ScreenTranslatorApp
 
         void BeginOnce(Rectangle rect, Bitmap bmp)
         {
-            overlay = new OverlayForm(rect, false);
-            overlay.Dismissed += delegate { CloseOverlay(); panel.SetStatus("준비됨"); };
+            watchTimer.Stop();
+            watchRect = rect;
+            baseSig = Signature(bmp);
+            overlay = new OverlayForm(rect);
             overlay.SetContent(new List<Item>(), "번역 중...");
             overlay.Show();
             panel.SetStatus("번역 중...");
@@ -1975,7 +2493,7 @@ namespace ScreenTranslatorApp
             liveOn = true;
             lastSig = null;
             OcrService.BestLang = null;
-            overlay = new OverlayForm(rect, true);
+            overlay = new OverlayForm(rect);
             overlay.SetContent(new List<Item>(), "실시간 번역 시작");
             overlay.Show();
             panel.SetLive(true);
@@ -2033,15 +2551,29 @@ namespace ScreenTranslatorApp
                     }
                     string status = "";
                     if (err.Length > 0) status = err;
-                    else if (items.Count == 0 && !liveOn) status = "번역할 외국어 텍스트를 찾지 못했어요 (클릭하면 닫혀요)";
+                    else if (items.Count == 0 && !liveOn) status = "번역할 외국어 텍스트를 찾지 못했어요";
                     overlay.SetContent(items, status);
 
                     string ps;
                     if (err.Length > 0) ps = err;
                     else if (items.Count == 0) ps = "번역할 외국어를 찾지 못했어요";
                     else if (liveOn) ps = "실시간 번역 중... (" + items.Count + "개)";
-                    else ps = "번역 완료 (" + items.Count + "개) - 번역 화면을 클릭하면 닫혀요";
+                    else ps = st.AutoClear ? "번역 완료 (" + items.Count + "개) - 화면이 바뀌면 자동으로 지워져요"
+                                           : "번역 완료 (" + items.Count + "개) - 지우기: Ctrl+Alt+X";
                     panel.SetStatus(ps);
+
+                    if (!liveOn)
+                    {
+                        if (items.Count == 0)
+                        {
+                            // 번역할 게 없으면 안내만 잠깐 보여주고 닫아요
+                            System.Windows.Forms.Timer bye = new System.Windows.Forms.Timer();
+                            bye.Interval = err.Length > 0 ? 6000 : 2500;
+                            bye.Tick += delegate { bye.Stop(); bye.Dispose(); if (id == jobId) CloseOverlay(); };
+                            bye.Start();
+                        }
+                        else if (st.AutoClear) watchTimer.Start();
+                    }
                 });
             });
         }
@@ -2049,6 +2581,7 @@ namespace ScreenTranslatorApp
         // ---------- updates ----------
         void OnUpdTick(object sender, EventArgs e)
         {
+            Translator.SaveMemory(false);
             DateTime now = DateTime.UtcNow;
             if (st.AutoUpdate && st.UpdateUrl.Length > 0 && !updBusy && now >= nextUpd) StartUpdateCheck(false);
             if (!oldCleaned && (now - startTime).TotalSeconds > 10)
@@ -2159,6 +2692,7 @@ namespace ScreenTranslatorApp
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             StopAll();
+            Translator.SaveMemory(true);
             if (notify != null) { notify.Visible = false; notify.Dispose(); }
             if (panel != null) { try { panel.Dispose(); } catch { } }
             base.OnFormClosing(e);
