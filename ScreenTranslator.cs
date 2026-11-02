@@ -1289,7 +1289,7 @@ namespace ScreenTranslatorApp
                     if (errs[i] != null) Error = errs[i];
                     if (results[i] == null) continue;
                     int score = 0;
-                    foreach (LineInfo li in results[i]) foreach (char c in li.Text) if (char.IsLetterOrDigit(c)) score++;
+                    foreach (LineInfo li in results[i]) score += Score(li.Text);
                     if (score > bestScore) { bestScore = score; best = results[i]; bestTag = tryTags[i]; }
                 }
                 if (bestTag != null && bestScore > 0) BestLang = bestTag;
@@ -1299,6 +1299,24 @@ namespace ScreenTranslatorApp
             {
                 if (own) prep.Dispose();
             }
+        }
+
+        // 언어 고르기 점수. 한글은 0점이에요: 한국어는 번역 대상이 아니고, 한국어 OCR 이 일본어·중국어 화면을
+        // 엉터리 한글로 많이 읽어서 점수를 따 가는 바람에 엉뚱한 언어가 뽑히던 문제가 있었어요.
+        // 가나는 일본어 OCR 만 읽을 수 있어서 높게 쳐요.
+        static int Score(string t)
+        {
+            int sc = 0;
+            foreach (char c in t)
+            {
+                if (c >= 0x3041 && c <= 0x30FF && c != 0x30FB) sc += 4;          // 히라가나·가타카나 (・ 제외)
+                else if (c >= 0x4E00 && c <= 0x9FFF) sc += 3;                    // 한자
+                else if (c >= 0xAC00 && c <= 0xD7A3) sc += 0;                    // 한글
+                else if (c >= 0x3131 && c <= 0x318E) sc -= 2;                    // 낱자모(ㅏ, ㅎ) = 거의 항상 잘못 읽은 것
+                else if (char.IsLetter(c)) sc += 2;                              // 라틴·키릴 등
+                else if (char.IsDigit(c)) sc += 1;
+            }
+            return sc;
         }
 
         static void RunTag(string tag, byte[] raw, int bw, int bh, float factor, List<LineInfo>[] results, string[] errs, int idx)
@@ -1393,12 +1411,37 @@ namespace ScreenTranslatorApp
             return res;
         }
 
+        const string OkPunct = " .,!?:;'\"()[]-–—…・ー、。「」『』！？：；（）〜~%/&+#*";
+
+        // OCR 이 그림·로고·장식을 글자로 잘못 읽은 줄을 걸러요
+        static bool LooksLikeJunk(string t)
+        {
+            int letters = 0, weird = 0, hangul = 0, cjk = 0, jamo = 0;
+            foreach (char c in t)
+            {
+                if (c >= 0xAC00 && c <= 0xD7A3) { hangul++; letters++; }
+                else if (c >= 0x3131 && c <= 0x318E) { jamo++; }
+                else if (c >= 0x3041 && c <= 0x9FFF) { cjk++; letters++; }
+                else if (char.IsLetter(c)) letters++;
+                else if (char.IsDigit(c)) { }
+                else if (OkPunct.IndexOf(c) < 0) weird++;
+            }
+            if (letters == 0) return true;
+            if (jamo > 0) return true;                       // ㅏ ㅎ 같은 낱자모는 실제 화면 글자에서 거의 안 나와요
+            if (hangul > 0 && cjk > 0) return true;           // 한글과 가나·한자가 한 줄에 섞임 = 잘못 읽음
+            if (weird * 3 > t.Length) return true;            // 이상한 기호가 1/3 이상
+            if (cjk == 0 && letters <= 2 && t.Length <= 4) return true; // "4f", "l1" 같은 짧은 조각
+            return false;
+        }
+
         public static List<Item> Process(Bitmap bmp, bool detect, out string error)
         {
             error = "";
             List<LineInfo> lines = OcrService.Recognize(bmp, detect);
             if (OcrService.Error.Length > 0 && lines.Count == 0) { error = OcrService.Error; return new List<Item>(); }
-            List<Para> paras = Merge(lines);
+            List<LineInfo> good = new List<LineInfo>();
+            foreach (LineInfo li in lines) if (!LooksLikeJunk(li.Text)) good.Add(li);
+            List<Para> paras = Merge(good);
             List<Para> todo = new List<Para>();
             foreach (Para p in paras) if (Translator.WorthTranslating(p.Text)) todo.Add(p);
 
@@ -1991,7 +2034,7 @@ namespace ScreenTranslatorApp
     // ------------------------------------------------------------------ app info / self update
     static class AppInfo
     {
-        public const int AppVersion = 8;
+        public const int AppVersion = 9;
 
         public static string DataDir()
         {
