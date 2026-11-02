@@ -818,7 +818,7 @@ namespace ScreenTranslatorApp
             string win = Environment.GetEnvironmentVariable("WINDIR");
             if (string.IsNullOrEmpty(win)) win = @"C:\Windows";
             StringBuilder sb = new StringBuilder("/r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll ");
-            string[] names = { "System.Runtime.dll" };
+            string[] names = { "System.Runtime.dll", "System.Runtime.WindowsRuntime.dll" };
             foreach (string n in names)
             {
                 string p = Path.Combine(dir, n);
@@ -1131,7 +1131,7 @@ namespace ScreenTranslatorApp
         }
 
         // ---------- capture ----------
-        static Bitmap Capture(Rectangle r)
+        static Bitmap CaptureScreen(Rectangle r)
         {
             Bitmap b = new Bitmap(r.Width, r.Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
             using (Graphics g = Graphics.FromImage(b)) g.CopyFromScreen(r.X, r.Y, 0, 0, r.Size, CopyPixelOperation.SourceCopy);
@@ -1189,7 +1189,7 @@ namespace ScreenTranslatorApp
         {
             StopAll();
             Rectangle vs = SystemInformation.VirtualScreen;
-            Bitmap shot = Capture(vs);
+            Bitmap shot = CaptureScreen(vs);
             Rectangle rect;
             using (SelectForm sf = new SelectForm(shot, vs))
             {
@@ -1214,7 +1214,7 @@ namespace ScreenTranslatorApp
         {
             StopAll();
             Rectangle r = Screen.FromPoint(Cursor.Position).Bounds;
-            Bitmap bmp = Capture(r);
+            Bitmap bmp = CaptureScreen(r);
             BeginOnce(r, bmp);
         }
 
@@ -1247,7 +1247,7 @@ namespace ScreenTranslatorApp
             bool hidden = false;
             if (!overlay.ExcludedFromCapture) { overlay.Opacity = 0; hidden = true; Application.DoEvents(); Thread.Sleep(30); }
             Bitmap bmp;
-            try { bmp = Capture(liveRect); }
+            try { bmp = CaptureScreen(liveRect); }
             finally { if (hidden && overlay != null) overlay.Opacity = 1; }
             byte[] sig = Signature(bmp);
             if (!Changed(lastSig, sig)) { bmp.Dispose(); return; }
