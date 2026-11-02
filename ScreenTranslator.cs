@@ -1873,6 +1873,9 @@ namespace ScreenTranslatorApp
             // 작은 영역은 2배만, 이미 한 번 정해졌으면 그 배율만 읽어요.
             List<float> factors = new List<float>();
             float cap = (float)maxDim / big;
+            // 화면에서 큰 장식 글자(메뉴 제목 등)는 Windows OCR이 한 글자씩 쪼개 읽거나 못 읽어요. 줄여서 읽으면 잘 읽혀요 (0.33배, 0.5배).
+            if (big >= 900) factors.Add(0.33f);
+            if (big >= 600) factors.Add(0.5f);
             if (big >= 1000) factors.Add(1f);
             if (cap >= 1.2f) factors.Add(Math.Min(2f, cap));
             if (factors.Count == 0) factors.Add(1f);
@@ -2934,7 +2937,7 @@ namespace ScreenTranslatorApp
     // ------------------------------------------------------------------ app info / self update
     static class AppInfo
     {
-        public const int AppVersion = 15;
+        public const int AppVersion = 16;
 
         public static string DataDir()
         {
